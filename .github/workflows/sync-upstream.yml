@@ -1,0 +1,68 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # UTC 每天5点执行（可改频率）
+  workflow_dispatch:      # 允许手动点按钮立即运行
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 给token写入权限
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main   # 你的主分支，也可能是 master
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Set git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/AltureT/hydro-ai-helper.git
+          # git tag -l | xargs git tag -d    # 清空本地所有标签，保证只保留上游的标签
+          git fetch upstream --tags
+
+      - name: Rebase upstream main branch
+        run: git rebase upstream/main
+
+      - name: Push origin main branch (force)
+        run: git push -f origin main
+
+      - name: Push tags to origin (full sync)
+        run: |
+          git push origin --tags --force --prune
+
+      - name: Sync all release metadata from upstream
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          UPSTREAM_REPO: AltureT/hydro-ai-helper
+        run: |
+          curl -s "https://api.github.com/repos/$UPSTREAM_REPO/releases?per_page=100" \
+            -H "Accept: application/vnd.github.v3+json" \
+            > /tmp/upstream_releases.json
+
+          jq -c '.[]' /tmp/upstream_releases.json | while read -r release; do
+            TAG=$(echo "$release" | jq -r '.tag_name')
+            TITLE=$(echo "$release" | jq -r '.name')
+            BODY=$(echo "$release" | jq -r '.body')
+            IS_PRE=$(echo "$release" | jq -r '.prerelease')
+            IS_DRAFT=$(echo "$release" | jq -r '.draft')
+
+            echo "$BODY" > /tmp/release_body.md
+
+            PRE_FLAG=$([ "$IS_PRE" = "true" ] && echo "--prerelease" || echo "--prerelease=false")
+            DRAFT_FLAG=$([ "$IS_DRAFT" = "true" ] && echo "--draft" || echo "--draft=false")
+
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --notes-file /tmp/release_body.md $PRE_FLAG $DRAFT_FLAG
+            else
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --notes-file /tmp/release_body.md $PRE_FLAG $DRAFT_FLAG
+            fi
+          done

@@ -1005,8 +1005,13 @@ async function handleAlertConfigTest(request, env) {
     const { status, description } = await sendTelegram(cfg.token, cfg.chat_id, '✅ hydro-ai-helper 测试消息');
     const code = mapTelegramError(status);
     return noStoreJson({ ok: code === null, error: code || undefined, detail: description });
-  } catch {
-    return noStoreJson({ ok: false, error: 'upstream_failure', detail: '请求未完成(网络/超时/重定向)' });
+  } catch (e) {
+    // Surface the throw category (token-stripped, capped) so a thrown fetch is
+    // diagnosable: TimeoutError ⇒ CF→Telegram hung; TypeError ⇒ connect/redirect.
+    const name = e && e.name ? String(e.name) : 'Error';
+    let msg = e && e.message ? String(e.message) : '';
+    msg = msg.replace(/\d{5,}:[A-Za-z0-9_-]{20,}/g, '[tok]').replace(/bot\d+[^/\s]*/gi, 'bot[tok]').slice(0, 140);
+    return noStoreJson({ ok: false, error: 'upstream_failure', detail: `${name}: ${msg}` });
   }
 }
 

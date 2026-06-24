@@ -125,6 +125,7 @@ test('mapTelegramError maps Telegram HTTP statuses to safe codes', () => {
   assert.equal(mapTelegramError(401), 'invalid_token');
   assert.equal(mapTelegramError(404), 'invalid_token');
   assert.equal(mapTelegramError(400), 'chat_not_found');
+  assert.equal(mapTelegramError(403), 'forbidden');
   assert.equal(mapTelegramError(500), 'upstream_failure');
   assert.equal(mapTelegramError(200), null);
 });

@@ -60,4 +60,4 @@ export const removeAlertConfig = () =>
   postApi<{ success: boolean }>('/api/dashboard/alert-config/remove');
 
 export const testAlertConfig = () =>
-  postApi<{ ok: boolean; error?: string }>('/api/dashboard/alert-config/test');
+  postApi<{ ok: boolean; error?: string; detail?: string }>('/api/dashboard/alert-config/test');

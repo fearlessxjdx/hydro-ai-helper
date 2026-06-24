@@ -922,7 +922,9 @@ async function pushTelegram(alerts, env) {
   await sendTelegram(cfg.token, cfg.chat_id, buildSafeAlertText(alerts));
 }
 
-/** Fire a Telegram sendMessage. Never logs the URL/token/body; bounded + redirect-safe. */
+/** Fire a Telegram sendMessage. Never logs the URL/token/body; bounded + redirect-safe.
+ *  Returns { status, description } — description is Telegram's own (non-secret)
+ *  error text, e.g. "Forbidden: bot can't initiate conversation with a user". */
 async function sendTelegram(token, chatId, text) {
   const { url, body } = buildTelegramRequest(token, chatId, text);
   const resp = await fetch(url, {
@@ -932,7 +934,12 @@ async function sendTelegram(token, chatId, text) {
     redirect: 'error',
     signal: AbortSignal.timeout(8000),
   });
-  return resp.status; // caller maps; response body intentionally discarded
+  let description;
+  try {
+    const j = await resp.json();
+    if (j && typeof j.description === 'string') description = j.description.slice(0, 200);
+  } catch { /* body not JSON — ignore */ }
+  return { status: resp.status, description };
 }
 
 async function handleAlertConfigGet(request, env) {
@@ -995,11 +1002,11 @@ async function handleAlertConfigTest(request, env) {
   await env.DB.prepare(`UPDATE plugin_alert_channels SET last_test_at = datetime('now') WHERE id = 'telegram'`).run();
 
   try {
-    const status = await sendTelegram(cfg.token, cfg.chat_id, '✅ hydro-ai-helper 测试消息');
+    const { status, description } = await sendTelegram(cfg.token, cfg.chat_id, '✅ hydro-ai-helper 测试消息');
     const code = mapTelegramError(status);
-    return noStoreJson({ ok: code === null, error: code || undefined });
+    return noStoreJson({ ok: code === null, error: code || undefined, detail: description });
   } catch {
-    return noStoreJson({ ok: false, error: 'upstream_failure' });
+    return noStoreJson({ ok: false, error: 'upstream_failure', detail: '请求未完成(网络/超时/重定向)' });
   }
 }
 

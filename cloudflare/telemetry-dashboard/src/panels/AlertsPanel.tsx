@@ -12,6 +12,7 @@ const ERR_MSG: Record<string, string> = {
   rate_limited: '操作过于频繁，请几秒后再试',
   invalid_token: 'Bot Token 无效',
   chat_not_found: 'Chat ID 无效，或机器人尚未加入该会话',
+  forbidden: '机器人无法向该会话发送（私聊需先给 bot 发 /start；群/频道需把 bot 加入/设管理员）',
   not_decryptable: '无法解密，请重新填写 Token',
   not_configured: '请先保存配置',
   upstream_failure: 'Telegram 暂时不可达，请稍后重试',
@@ -111,7 +112,7 @@ function TelegramConfigCard() {
       const res = await testAlertConfig();
       if (res.ok) setStatus('测试消息已发送 ✓');
       else if (res.error === 'rate_limited') setStatus('⏳ ' + errText('rate_limited'));
-      else setStatus('测试失败: ' + errText(res.error));
+      else setStatus('测试失败: ' + errText(res.error) + (res.detail ? `（Telegram: ${res.detail}）` : ''));
     } catch (e) { setStatus('测试失败: ' + (e as Error).message); }
     finally { setBusy(false); }
   };

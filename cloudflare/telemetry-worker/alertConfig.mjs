@@ -97,6 +97,7 @@ export function mapTelegramError(httpStatus) {
   if (httpStatus === 200) return null;
   if (httpStatus === 401 || httpStatus === 404) return 'invalid_token';
   if (httpStatus === 400) return 'chat_not_found';
+  if (httpStatus === 403) return 'forbidden'; // bot blocked / not /start'd / not in chat
   return 'upstream_failure';
 }
 

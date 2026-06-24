@@ -48,7 +48,11 @@ jobs:
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true  # 自动生成 Release Notes
+          # Curated, user-facing notes only. Auto-generation is OFF so internal
+          # commit titles (infra/telemetry/etc.) are never surfaced publicly.
+          # Update .github/RELEASE_NOTES.md before each release tag.
+          body_path: .github/RELEASE_NOTES.md
+          generate_release_notes: false
           draft: false
           prerelease: false
         env:

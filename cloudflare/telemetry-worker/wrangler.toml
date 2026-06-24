@@ -14,7 +14,8 @@ database_id = "cf64e9c6-31d3-4d0b-b7b2-57bb606b66a5"
 migrations_dir = "migrations"
 
 [triggers]
-crons = ["0 19 * * *"]
+# Daily tick runs cleanup + alerts; hourly tick runs alerts only.
+crons = ["0 19 * * *", "0 * * * *"]
 
 [observability]
 enabled = true

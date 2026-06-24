@@ -59,4 +59,13 @@ export interface FeatureHealth {
   last_success_at: string | null;
 }
 
-export type Tab = 'overview' | 'instances' | 'errors' | 'feature-health' | 'feedback';
+export interface Alert {
+  id: number;
+  alert_key: string;
+  severity: string;
+  title: string;
+  detail: string | null;
+  created_at: string;
+}
+
+export type Tab = 'overview' | 'instances' | 'errors' | 'feature-health' | 'alerts' | 'feedback';

@@ -670,6 +670,149 @@ async function attachRelatedErrors(feedback, env) {
   });
 }
 
+// ─── Alerting ──────────────────────────────────────────
+
+const ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000; // don't re-raise the same key within 6h
+
+// Evaluate alert rules against collected data, dedup against recently-raised
+// alerts, persist new ones, and push to a webhook if configured. Rules backed by
+// plugin_errors work on existing data; feature-outage needs v2.1.0+ instances.
+async function evaluateAlerts(env) {
+  const now = Date.now();
+  const cutoff24h = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+  const cutoff7d = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const candidates = [];
+
+  // Rule A — a whole feature is down (attempted but zero successes).
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT feature, SUM(attempts) AS attempts, SUM(successes) AS successes
+       FROM plugin_feature_stats
+       WHERE report_at >= ?
+       GROUP BY feature
+       HAVING SUM(attempts) >= 5 AND SUM(successes) = 0`,
+    ).bind(cutoff7d).all();
+    for (const r of (rows?.results || [])) {
+      candidates.push({
+        alert_key: `feature_outage:${r.feature}`,
+        severity: 'critical',
+        title: `功能瘫痪: ${r.feature}`,
+        detail: `近 7 天 ${r.attempts} 次尝试、0 次成功（错误率聚合无法体现）`,
+      });
+    }
+  } catch (e) { console.error('[alerts] rule A failed', e); }
+
+  // Rule B — background-job features are throwing.
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT category, SUM(count) AS total, COUNT(DISTINCT instance_id) AS instances, MAX(message) AS sample
+       FROM plugin_errors
+       WHERE error_type = 'background_job' AND received_at >= ?
+       GROUP BY category`,
+    ).bind(cutoff24h).all();
+    for (const r of (rows?.results || [])) {
+      candidates.push({
+        alert_key: `bg_error:${r.category}`,
+        severity: 'warning',
+        title: `后台功能报错: ${r.category}`,
+        detail: `近 24h ${r.total} 次 / ${r.instances} 实例 · ${(r.sample || '').slice(0, 160)}`,
+      });
+    }
+  } catch (e) { console.error('[alerts] rule B failed', e); }
+
+  // Rule C — the same error hitting many instances (widespread regression).
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT stack_fingerprint, category, SUM(count) AS total, COUNT(DISTINCT instance_id) AS instances, MAX(message) AS sample
+       FROM plugin_errors
+       WHERE received_at >= ? AND error_type != 'background_job'
+       GROUP BY stack_fingerprint
+       HAVING COUNT(DISTINCT instance_id) >= 3
+       ORDER BY instances DESC
+       LIMIT 10`,
+    ).bind(cutoff24h).all();
+    for (const r of (rows?.results || [])) {
+      candidates.push({
+        alert_key: `widespread:${r.stack_fingerprint}`,
+        severity: 'warning',
+        title: `多实例错误: ${r.category}`,
+        detail: `近 24h ${r.instances} 实例 / ${r.total} 次 · ${(r.sample || '').slice(0, 160)}`,
+      });
+    }
+  } catch (e) { console.error('[alerts] rule C failed', e); }
+
+  if (candidates.length === 0) return;
+
+  // Dedup against alerts raised within the cooldown window.
+  const cooldownCutoff = new Date(now - ALERT_COOLDOWN_MS).toISOString();
+  const fresh = [];
+  for (const c of candidates) {
+    const existing = await env.DB.prepare(
+      `SELECT 1 FROM plugin_alerts WHERE alert_key = ? AND created_at >= ? LIMIT 1`,
+    ).bind(c.alert_key, cooldownCutoff).first();
+    if (!existing) fresh.push(c);
+  }
+  if (fresh.length === 0) return;
+
+  await env.DB.batch(fresh.map((c) =>
+    env.DB.prepare(
+      `INSERT INTO plugin_alerts (alert_key, severity, title, detail) VALUES (?, ?, ?, ?)`,
+    ).bind(c.alert_key, c.severity, c.title, c.detail || null),
+  ));
+
+  await pushAlerts(fresh, env);
+  console.log(`[alerts] raised ${fresh.length} new alert(s)`);
+}
+
+async function pushAlerts(alerts, env) {
+  const url = (env.ALERT_WEBHOOK_URL || '').trim();
+  if (!url) return; // external push is opt-in
+  const format = (env.ALERT_WEBHOOK_FORMAT || 'generic').trim().toLowerCase();
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(formatAlertPayload(format, alerts)),
+    });
+  } catch (e) {
+    console.error('[alerts] webhook push failed', e);
+  }
+}
+
+function formatAlertPayload(format, alerts) {
+  const lines = alerts.map((a) => `[${a.severity}] ${a.title}${a.detail ? ` — ${a.detail}` : ''}`);
+  const text = `🚨 hydro-ai-helper 告警 (${alerts.length})\n${lines.join('\n')}`;
+  switch (format) {
+    case 'slack':
+      return { text };
+    case 'discord':
+      return { content: text };
+    case 'feishu':
+      return { msg_type: 'text', content: { text } };
+    case 'dingtalk':
+      return { msgtype: 'text', text: { content: text } };
+    default:
+      return { summary: `${alerts.length} alert(s)`, text, alerts };
+  }
+}
+
+async function handleDashboardAlerts(request, env) {
+  if (!isDashboardAuthorized(request, env)) {
+    return json({ success: false, error: 'Unauthorized' }, { status: 401 });
+  }
+  const url = new URL(request.url);
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 100);
+  const cutoff7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const rows = await env.DB.prepare(
+    `SELECT id, alert_key, severity, title, detail, created_at
+     FROM plugin_alerts
+     WHERE created_at >= ?
+     ORDER BY created_at DESC
+     LIMIT ?`,
+  ).bind(cutoff7d, limit).all();
+  return json({ alerts: rows?.results || [] });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -708,6 +851,8 @@ export default {
         return handleDashboardErrors(request, env);
       case '/api/dashboard/feature-health':
         return handleDashboardFeatureHealth(request, env);
+      case '/api/dashboard/alerts':
+        return handleDashboardAlerts(request, env);
       case '/api/dashboard/feedback':
         return handleDashboardFeedback(request, env);
       case '/api/badge-installs':
@@ -723,12 +868,18 @@ export default {
     }
   },
 
-  async scheduled(_event, env, ctx) {
+  async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
       if (!env.DB) {
         console.error('[cron] DB binding missing (expected env.DB)');
         return;
       }
+
+      // Evaluate alerts on every tick (hourly); cheap and dedup-protected.
+      await evaluateAlerts(env).catch((e) => console.error('[cron] evaluateAlerts failed', e));
+
+      // Cleanup is heavier and only needs to run once a day.
+      if (event && event.cron !== '0 19 * * *') return;
 
       const cutoff90d = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
       const cutoff30d = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -760,6 +911,11 @@ export default {
         `UPDATE plugin_feedback SET contact_email = NULL
          WHERE contact_email IS NOT NULL AND received_at < ?`,
       ).bind(cutoff90d).run();
+
+      // Clean up old alerts (30 days)
+      await env.DB.prepare(
+        `DELETE FROM plugin_alerts WHERE created_at < ?`,
+      ).bind(cutoff30d).run();
 
       console.log('[cron] cleanup done, 90d =', cutoff90d, ', 30d =', cutoff30d);
     })());

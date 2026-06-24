@@ -5,7 +5,7 @@
  */
 
 import type { Db, Collection } from 'mongodb';
-import { createHash } from 'crypto';
+import { randomUUID } from 'crypto';
 
 /**
  * 插件安装记录接口
@@ -31,32 +31,14 @@ export interface PluginInstall {
 export class PluginInstallModel {
   private collection: Collection<PluginInstall>;
   private readonly FIXED_ID = 'install'; // 固定记录 ID
-  private db: Db;
+
+  // 合法 instanceId 的格式（randomUUID v4）。任何不匹配此格式的值都是
+  // v2.0.x 残留的「确定性哈希」ID，需要迁移为唯一 UUID。
+  private static readonly UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   constructor(db: Db) {
     this.collection = db.collection<PluginInstall>('ai_plugin_install');
-    this.db = db;
-  }
-
-  /**
-   * 基于 MongoDB 连接信息生成确定性 instanceId
-   * 同一 MongoDB + 同一数据库 = 同一 instanceId（不含 hostname 以兼容 Docker 重建）
-   */
-  private async generateStableInstanceId(): Promise<string> {
-    try {
-      const admin = this.db.admin();
-      const serverStatus = await admin.serverInfo();
-      const mongoHost = serverStatus.host || 'unknown';
-      const dbName = this.db.databaseName;
-      return createHash('sha256')
-        .update(`${mongoHost}:${dbName}`)
-        .digest('hex');
-    } catch {
-      const dbName = this.db.databaseName;
-      return createHash('sha256')
-        .update(`fallback:${dbName}`)
-        .digest('hex');
-    }
   }
 
   /**
@@ -81,13 +63,12 @@ export class PluginInstallModel {
    */
   async createIfMissing(version: string): Promise<void> {
     const existing = await this.getInstall();
-    const stableId = await this.generateStableInstanceId();
 
     if (!existing) {
       const now = new Date();
       await this.collection.insertOne({
         _id: this.FIXED_ID,
-        instanceId: stableId,
+        instanceId: randomUUID(), // 唯一标识，持久化于 MongoDB（数据卷保留即跨容器重建稳定）
         installedAt: now,
         installedVersion: version,
         lastVersion: version,
@@ -95,20 +76,23 @@ export class PluginInstallModel {
         telemetryEnabled: true
       } as PluginInstall);
 
-      console.log('[PluginInstallModel] Install record created with stable instanceId');
-    } else {
-      const updates: Record<string, any> = { lastVersion: version };
-      // Migrate from random UUID to stable ID
-      if (existing.instanceId !== stableId) {
-        updates.instanceId = stableId;
-        console.log('[PluginInstallModel] Migrated instanceId to stable hash');
-      }
-      await this.collection.updateOne(
-        { _id: this.FIXED_ID },
-        { $set: updates }
-      );
-      console.log('[PluginInstallModel] Install record updated, version:', version);
+      console.log('[PluginInstallModel] Install record created');
+      return;
     }
+
+    const updates: Record<string, any> = { lastVersion: version };
+    // 一次性迁移：v2.0.x 的「确定性哈希」instanceId 因 serverInfo() 无 host 字段，
+    // 退化为 sha256('unknown:'+dbName)，导致所有部署共享同一个 ID。
+    // 凡是非 UUID 格式的旧值，替换为唯一 UUID 以解除碰撞。
+    if (!PluginInstallModel.UUID_RE.test(existing.instanceId || '')) {
+      updates.instanceId = randomUUID();
+      console.log('[PluginInstallModel] Replaced legacy deterministic instanceId with unique UUID');
+    }
+    await this.collection.updateOne(
+      { _id: this.FIXED_ID },
+      { $set: updates }
+    );
+    console.log('[PluginInstallModel] Install record updated, version:', version);
   }
 
   /**

@@ -15,28 +15,6 @@ class PluginInstallModel {
     constructor(db) {
         this.FIXED_ID = 'install'; // 固定记录 ID
         this.collection = db.collection('ai_plugin_install');
-        this.db = db;
-    }
-    /**
-     * 基于 MongoDB 连接信息生成确定性 instanceId
-     * 同一 MongoDB + 同一数据库 = 同一 instanceId（不含 hostname 以兼容 Docker 重建）
-     */
-    async generateStableInstanceId() {
-        try {
-            const admin = this.db.admin();
-            const serverStatus = await admin.serverInfo();
-            const mongoHost = serverStatus.host || 'unknown';
-            const dbName = this.db.databaseName;
-            return (0, crypto_1.createHash)('sha256')
-                .update(`${mongoHost}:${dbName}`)
-                .digest('hex');
-        }
-        catch {
-            const dbName = this.db.databaseName;
-            return (0, crypto_1.createHash)('sha256')
-                .update(`fallback:${dbName}`)
-                .digest('hex');
-        }
     }
     /**
      * 确保索引已创建
@@ -58,30 +36,30 @@ class PluginInstallModel {
      */
     async createIfMissing(version) {
         const existing = await this.getInstall();
-        const stableId = await this.generateStableInstanceId();
         if (!existing) {
             const now = new Date();
             await this.collection.insertOne({
                 _id: this.FIXED_ID,
-                instanceId: stableId,
+                instanceId: (0, crypto_1.randomUUID)(), // 唯一标识，持久化于 MongoDB（数据卷保留即跨容器重建稳定）
                 installedAt: now,
                 installedVersion: version,
                 lastVersion: version,
                 domainsSeen: [],
                 telemetryEnabled: true
             });
-            console.log('[PluginInstallModel] Install record created with stable instanceId');
+            console.log('[PluginInstallModel] Install record created');
+            return;
         }
-        else {
-            const updates = { lastVersion: version };
-            // Migrate from random UUID to stable ID
-            if (existing.instanceId !== stableId) {
-                updates.instanceId = stableId;
-                console.log('[PluginInstallModel] Migrated instanceId to stable hash');
-            }
-            await this.collection.updateOne({ _id: this.FIXED_ID }, { $set: updates });
-            console.log('[PluginInstallModel] Install record updated, version:', version);
+        const updates = { lastVersion: version };
+        // 一次性迁移：v2.0.x 的「确定性哈希」instanceId 因 serverInfo() 无 host 字段，
+        // 退化为 sha256('unknown:'+dbName)，导致所有部署共享同一个 ID。
+        // 凡是非 UUID 格式的旧值，替换为唯一 UUID 以解除碰撞。
+        if (!PluginInstallModel.UUID_RE.test(existing.instanceId || '')) {
+            updates.instanceId = (0, crypto_1.randomUUID)();
+            console.log('[PluginInstallModel] Replaced legacy deterministic instanceId with unique UUID');
         }
+        await this.collection.updateOne({ _id: this.FIXED_ID }, { $set: updates });
+        console.log('[PluginInstallModel] Install record updated, version:', version);
     }
     /**
      * 标记首次使用时间
@@ -127,4 +105,7 @@ class PluginInstallModel {
     }
 }
 exports.PluginInstallModel = PluginInstallModel;
+// 合法 instanceId 的格式（randomUUID v4）。任何不匹配此格式的值都是
+// v2.0.x 残留的「确定性哈希」ID，需要迁移为唯一 UUID。
+PluginInstallModel.UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 //# sourceMappingURL=pluginInstall.js.map

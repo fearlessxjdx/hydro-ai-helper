@@ -57,7 +57,9 @@ describe('PluginInstallModel', () => {
   });
 
   describe('createIfMissing', () => {
-    it('should create new record when none exists', async () => {
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    it('should create new record with a unique UUID instanceId when none exists', async () => {
       mockColl.findOne.mockResolvedValue(null);
       mockColl.insertOne.mockResolvedValue({});
 
@@ -69,11 +71,29 @@ describe('PluginInstallModel', () => {
       expect(inserted.installedVersion).toBe('1.0.0');
       expect(inserted.lastVersion).toBe('1.0.0');
       expect(inserted.telemetryEnabled).toBe(true);
-      expect(inserted.instanceId).toBeTruthy();
+      // instanceId must be a real random UUID, not a deterministic hash
+      expect(inserted.instanceId).toMatch(UUID_RE);
     });
 
-    it('should update version when record already exists', async () => {
-      mockColl.findOne.mockResolvedValue({ _id: 'install', instanceId: 'old-uuid' });
+    it('two installs should get distinct instanceIds (no collision)', async () => {
+      mockColl.findOne.mockResolvedValue(null);
+      mockColl.insertOne.mockResolvedValue({});
+
+      await model.createIfMissing('1.0.0');
+      const otherModel = new PluginInstallModel(createMockDb(createMockCollection()) as any);
+      const otherColl = (otherModel as any).collection;
+      otherColl.findOne.mockResolvedValue(null);
+      otherColl.insertOne.mockResolvedValue({});
+      await otherModel.createIfMissing('1.0.0');
+
+      const a = mockColl.insertOne.mock.calls[0][0].instanceId;
+      const b = otherColl.insertOne.mock.calls[0][0].instanceId;
+      expect(a).not.toBe(b);
+    });
+
+    it('should preserve a valid existing UUID instanceId on version update', async () => {
+      const existingUuid = '11111111-2222-4333-8444-555555555555';
+      mockColl.findOne.mockResolvedValue({ _id: 'install', instanceId: existingUuid });
 
       await model.createIfMissing('2.0.0');
 
@@ -82,9 +102,21 @@ describe('PluginInstallModel', () => {
       const updateArgs = mockColl.updateOne.mock.calls[0];
       expect(updateArgs[0]).toEqual({ _id: 'install' });
       expect(updateArgs[1].$set.lastVersion).toBe('2.0.0');
-      // Should migrate from old UUID to stable hash
-      expect(updateArgs[1].$set.instanceId).toBeTruthy();
-      expect(updateArgs[1].$set.instanceId).not.toBe('old-uuid');
+      // A valid UUID must NOT be regenerated
+      expect(updateArgs[1].$set).not.toHaveProperty('instanceId');
+    });
+
+    it('should migrate a legacy deterministic (sha256) instanceId to a unique UUID', async () => {
+      // sha256('unknown:hydro') — the collided id all default installs shared
+      const collidedHash = 'cae41ba1e0e7bb866c5ca7c703c7825a14efe4623da13b406ac6891579188fff';
+      mockColl.findOne.mockResolvedValue({ _id: 'install', instanceId: collidedHash });
+
+      await model.createIfMissing('2.0.0');
+
+      const updateArgs = mockColl.updateOne.mock.calls[0];
+      expect(updateArgs[1].$set.lastVersion).toBe('2.0.0');
+      expect(updateArgs[1].$set.instanceId).toMatch(UUID_RE);
+      expect(updateArgs[1].$set.instanceId).not.toBe(collidedHash);
     });
   });
 

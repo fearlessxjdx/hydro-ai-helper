@@ -125,4 +125,64 @@ describe('ErrorReporter', () => {
       // Should be deduplicated to one entry
     });
   });
+
+  describe('sanitized stack frames + runtime env (P1)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function lastPayload(): any {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { sendToEndpoint } = require('../../services/telemetryService');
+      const calls = sendToEndpoint.mock.calls;
+      return calls[calls.length - 1][1];
+    }
+
+    it('attaches repo-relative, PII-stripped stack frames on flush', async () => {
+      const stack = [
+        'Error: boom sk-secret123',
+        '    at Foo.bar (/Users/alice/proj/hydro-ai-helper/dist/services/x.js:12:5)',
+        '    at async safe (/root/.hydro/addons/hydro-ai-helper/dist/index.js:160:9)',
+        '    at Query.run (/srv/app/node_modules/mongodb/lib/y.js:99:9)',
+        '    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)',
+      ].join('\n');
+      reporter.capture('startup_failure', 'db', 'boom', undefined, stack);
+
+      // eslint-disable-next-line @typescript-eslint/dot-notation
+      await (reporter as any).flush();
+
+      const entry = lastPayload().errors[0];
+      expect(entry.stack_frames).toEqual([
+        'at Foo.bar (dist/services/x.js:12:5)',
+        'at async safe (dist/index.js:160:9)',
+        'at Query.run (node_modules/mongodb/lib/y.js:99:9)',
+        'at process.processTicksAndRejections (node:internal/process/task_queues:95:5)',
+      ]);
+      // No home directory or absolute deploy paths leaked
+      const joined = entry.stack_frames.join('\n');
+      expect(joined).not.toContain('/Users/alice');
+      expect(joined).not.toContain('/root/.hydro');
+    });
+
+    it('omits stack_frames when no stack is provided', async () => {
+      reporter.capture('api_failure', 'timeout', 'no stack here');
+      // eslint-disable-next-line @typescript-eslint/dot-notation
+      await (reporter as any).flush();
+      expect(lastPayload().errors[0].stack_frames).toBeUndefined();
+    });
+
+    it('attaches runtime env once set, and omits it otherwise', async () => {
+      reporter.capture('api_failure', 'timeout', 'no env');
+      // eslint-disable-next-line @typescript-eslint/dot-notation
+      await (reporter as any).flush();
+      expect(lastPayload().errors[0].env).toBeUndefined();
+
+      reporter.setRuntimeEnv({ node_version: 'v18.20.0' });
+      reporter.setRuntimeEnv({ mongodb_version: '6.0.5' });
+      reporter.capture('api_failure', 'auth', 'with env');
+      // eslint-disable-next-line @typescript-eslint/dot-notation
+      await (reporter as any).flush();
+      // find the entry for the 'with env' capture (auth category)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const entry = lastPayload().errors.find((e: any) => e.category === 'auth');
+      expect(entry.env).toEqual({ node_version: 'v18.20.0', mongodb_version: '6.0.5' });
+    });
+  });
 });

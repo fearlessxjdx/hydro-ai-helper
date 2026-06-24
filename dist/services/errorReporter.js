@@ -11,6 +11,8 @@ const MAX_PAYLOAD_BYTES = 64 * 1024;
 const SUPPRESSION_WINDOW_MS = 60 * 60 * 1000;
 const STALE_ENTRY_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT = 8000;
+const MAX_STACK_FRAMES = 10;
+const MAX_FRAME_LENGTH = 200;
 class ErrorReporter {
     constructor(pluginInstallModel) {
         this.pluginInstallModel = pluginInstallModel;
@@ -19,6 +21,16 @@ class ErrorReporter {
         this.pendingFlush = false;
         this.suppressedCount = 0;
         this.droppedCount = 0;
+        this.runtimeEnv = {};
+    }
+    /**
+     * Record the host runtime environment (MongoDB/Node version). Merged into
+     * every flushed error entry so the dashboard can locate version-specific
+     * failures. Called once at startup; MongoDB version may arrive slightly later
+     * (async buildInfo), so callers may invoke this more than once — fields merge.
+     */
+    setRuntimeEnv(env) {
+        this.runtimeEnv = { ...this.runtimeEnv, ...env };
     }
     start() {
         if (this.timer)
@@ -90,6 +102,8 @@ class ErrorReporter {
             firstSeen: now,
             lastSeen: now,
             stackFingerprint: fingerprint,
+            // Store only the sanitized frames — never retain the raw stack in memory.
+            stackFrames: this.sanitizeStack(stack),
             metadata: metadata ? this.sanitizeMetadata(metadata) : undefined,
             suppressedCount: 0,
         });
@@ -185,6 +199,9 @@ class ErrorReporter {
                 entry.count = 0;
                 continue;
             }
+            const env = (this.runtimeEnv.mongodb_version || this.runtimeEnv.node_version)
+                ? { ...this.runtimeEnv }
+                : undefined;
             const errorEntry = {
                 error_type: entry.error_type,
                 category: entry.category,
@@ -196,6 +213,8 @@ class ErrorReporter {
                 stack_fingerprint: entry.stackFingerprint,
                 suppressed_count: entry.suppressedCount > 0 ? entry.suppressedCount : undefined,
                 metadata: entry.metadata,
+                stack_frames: entry.stackFrames && entry.stackFrames.length ? entry.stackFrames : undefined,
+                env,
             };
             const entrySize = JSON.stringify(errorEntry).length;
             if (serializedSize + entrySize > MAX_PAYLOAD_BYTES) {
@@ -243,6 +262,54 @@ class ErrorReporter {
             }
         }
         return sanitized;
+    }
+    /**
+     * Convert a raw Error.stack into privacy-safe, repo-relative frames.
+     *
+     * - Drops the message line (already captured separately and may carry PII).
+     * - Keeps only the top {@link MAX_STACK_FRAMES} "at …" frames.
+     * - Rewrites absolute paths to repo-relative (`dist/…` / `src/…`), folds
+     *   `node_modules/<pkg>/…`, keeps `node:internal/…`, and replaces home
+     *   directories (`/Users/<x>/`, `/home/<x>/`, `C:\Users\<x>\`) with `~`.
+     * - Caps each frame length; function names are preserved.
+     */
+    sanitizeStack(stack) {
+        if (!stack || typeof stack !== 'string')
+            return undefined;
+        const frames = [];
+        for (const rawLine of stack.split('\n')) {
+            const line = rawLine.trim();
+            // Only keep actual frames; the leading "Error: <message>" line is skipped.
+            if (!line.startsWith('at '))
+                continue;
+            // Rewrite absolute path tokens (after "(" or whitespace) while leaving the
+            // surrounding "at <fn> (" text intact so the function name survives.
+            let frame = line.replace(
+            // eslint-disable-next-line no-useless-escape
+            /([(\s])(\/[^\s():]+|[A-Za-z]:\\[^\s():]+)/g, (_m, pre, p) => pre + this.shortenPath(p));
+            if (frame.length > MAX_FRAME_LENGTH) {
+                frame = frame.substring(0, MAX_FRAME_LENGTH) + '…';
+            }
+            frames.push(frame);
+            if (frames.length >= MAX_STACK_FRAMES)
+                break;
+        }
+        return frames.length ? frames : undefined;
+    }
+    shortenPath(rawPath) {
+        let p = rawPath.replace(/\\/g, '/');
+        const nm = p.lastIndexOf('node_modules/');
+        if (nm >= 0)
+            return p.slice(nm);
+        const repo = p.lastIndexOf('hydro-ai-helper/');
+        if (repo >= 0)
+            return p.slice(repo + 'hydro-ai-helper/'.length);
+        // Strip home directories anywhere in the remaining absolute path.
+        p = p
+            .replace(/\/Users\/[^/]+/g, '~')
+            .replace(/\/home\/[^/]+/g, '~')
+            .replace(/[A-Za-z]:\/Users\/[^/]+/g, '~');
+        return p;
     }
     sanitizeMessage(message) {
         let sanitized = message;

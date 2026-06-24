@@ -268,6 +268,34 @@ async function handleBadgeVersion(env) {
 
 // ─── Error Reports Handler ──────────────────────────────
 
+// Merge the plugin-supplied stack frames and runtime env into a single metadata
+// JSON blob (the trust boundary: re-sanitize lengths/shapes defensively). No
+// schema migration needed — these ride along in the existing `metadata` column.
+function buildErrorMetadata(e) {
+  const meta = isRecord(e.metadata) ? { ...e.metadata } : {};
+
+  if (Array.isArray(e.stack_frames)) {
+    const frames = e.stack_frames
+      .filter((f) => typeof f === 'string')
+      .slice(0, 10)
+      .map((f) => f.slice(0, 240));
+    if (frames.length) meta.stack_frames = frames;
+  }
+
+  if (isRecord(e.env)) {
+    const env_info = {};
+    if (typeof e.env.mongodb_version === 'string') {
+      env_info.mongodb_version = e.env.mongodb_version.slice(0, 40);
+    }
+    if (typeof e.env.node_version === 'string') {
+      env_info.node_version = e.env.node_version.slice(0, 40);
+    }
+    if (Object.keys(env_info).length) meta.env = env_info;
+  }
+
+  return Object.keys(meta).length ? JSON.stringify(meta).slice(0, 4000) : null;
+}
+
 async function handleErrors(request, env) {
   if (request.method === 'OPTIONS') {
     const headers = new Headers();
@@ -337,7 +365,7 @@ async function handleErrors(request, env) {
           typeof e.first_seen === 'string' ? e.first_seen : new Date().toISOString(),
           typeof e.last_seen === 'string' ? e.last_seen : new Date().toISOString(),
           typeof e.stack_fingerprint === 'string' ? e.stack_fingerprint.slice(0, 16) : null,
-          isRecord(e.metadata) ? JSON.stringify(e.metadata).slice(0, 4000) : null,
+          buildErrorMetadata(e),
         ),
       );
     }

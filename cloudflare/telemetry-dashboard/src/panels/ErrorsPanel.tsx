@@ -87,6 +87,24 @@ export function ErrorsPanel() {
                       </ul>
                     </details>
                   )}
+                  {meta.env && (meta.env.mongodb_version || meta.env.node_version) && (
+                    <div style={{ marginTop: 4 }}>
+                      {meta.env.mongodb_version && <span>MongoDB: <strong style={{ color: '#1f2937' }}>{String(meta.env.mongodb_version)}</strong></span>}
+                      {meta.env.node_version && <span style={{ marginLeft: 12 }}>Node: <strong style={{ color: '#1f2937' }}>{String(meta.env.node_version)}</strong></span>}
+                    </div>
+                  )}
+                  {Array.isArray(meta.stack_frames) && meta.stack_frames.length > 0 && (
+                    <details style={{ marginTop: 4 }}>
+                      <summary style={{ cursor: 'pointer' }}>脱敏堆栈 ({meta.stack_frames.length} 帧)</summary>
+                      <pre style={{
+                        margin: '4px 0', padding: '8px 10px', background: '#1f2937', color: '#e5e7eb',
+                        borderRadius: 6, fontSize: '11px', lineHeight: 1.5, overflowX: 'auto', whiteSpace: 'pre',
+                      }}>
+                        {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                        {meta.stack_frames.map((f: any) => String(f)).join('\n')}
+                      </pre>
+                    </details>
+                  )}
                 </div>
               )}
               <div style={{ display: 'flex', gap: 16, fontSize: '12px', color: '#6b7280', flexWrap: 'wrap' }}>

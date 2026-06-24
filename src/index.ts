@@ -154,6 +154,21 @@ const aiHelperPlugin = definePlugin<AIHelperConfig>({
     // ErrorReporter 需要在索引创建之前实例化，以便捕获启动错误
     const errorReporter = new ErrorReporter(pluginInstallModel);
 
+    // 采集运行环境，随错误上报以便面板定位版本相关故障。
+    // node 版本同步可得；MongoDB 版本异步 best-effort 查询一次后缓存（buildInfo
+    // 无需特殊权限），就绪后回填——错误在 flush 时才附加 env，早期空值会被覆盖。
+    errorReporter.setRuntimeEnv({ node_version: process.version });
+    (async () => {
+      try {
+        const info = await db.admin().command({ buildInfo: 1 });
+        if (info && typeof info.version === 'string') {
+          errorReporter.setRuntimeEnv({ mongodb_version: info.version });
+        }
+      } catch (err) {
+        console.warn('[AI-Helper] MongoDB buildInfo 查询失败（非致命）:', err instanceof Error ? err.message : String(err));
+      }
+    })();
+
     // 创建数据库索引（逐个容错，单个失败不阻塞插件加载）
     const safeEnsureIndexes = async (model: { ensureIndexes(): Promise<void> }, name: string) => {
       try {

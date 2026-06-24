@@ -3,6 +3,9 @@ export interface Overview {
   active_users_7d: number;
   total_conversations: number;
   error_rate_percent: number;
+  latency_p50_ms: number | null;
+  latency_p95_ms: number | null;
+  latency_p99_ms: number | null;
 }
 
 export interface Instance {

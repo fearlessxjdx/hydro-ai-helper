@@ -127,6 +127,7 @@ class TelemetryService {
             droppedErrorCount: selfStats?.droppedCount ?? 0,
             activeEndpointCount: aiConfig?.endpoints.filter(e => e.enabled).length ?? 0,
             featureStats: featureStats ?? [],
+            latencyBuckets: requestStats?.latencyBuckets ?? {},
         };
     }
     /**
@@ -177,6 +178,7 @@ class TelemetryService {
                     api_success_count_24h: stats.apiSuccessCount24h,
                     api_failure_count_24h: stats.apiFailureCount24h,
                     avg_latency_ms_24h: stats.avgLatencyMs24h,
+                    latency_buckets: stats.latencyBuckets,
                     error_count_24h: stats.errorCount24h,
                     suppressed_error_count: stats.suppressedErrorCount,
                     dropped_error_count: stats.droppedErrorCount,

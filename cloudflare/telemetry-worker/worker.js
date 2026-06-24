@@ -178,14 +178,18 @@ async function handleReport(request, env) {
     const nodeVersion = typeof env_info.node_version === 'string' ? env_info.node_version : null;
     const osPlatform = typeof env_info.os_platform === 'string' ? env_info.os_platform : null;
     const features = body.features ? JSON.stringify(body.features) : null;
+    const latencyBuckets = isRecord(stats.latency_buckets)
+      ? JSON.stringify(stats.latency_buckets).slice(0, 2000)
+      : null;
 
     await env.DB.prepare(
       `INSERT INTO plugin_stats (
         instance_id, event, version, installed_at, first_used_at,
         last_report_at, active_users_7d, total_conversations, last_used_at, domain_hash,
         error_count_24h, api_success_count_24h, api_failure_count_24h,
-        avg_latency_ms_24h, active_endpoint_count, node_version, os_platform, features
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        avg_latency_ms_24h, active_endpoint_count, node_version, os_platform, features,
+        latency_buckets
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(instance_id) DO UPDATE SET
         event = excluded.event,
         version = excluded.version,
@@ -202,7 +206,8 @@ async function handleReport(request, env) {
         active_endpoint_count = excluded.active_endpoint_count,
         node_version = excluded.node_version,
         os_platform = excluded.os_platform,
-        features = excluded.features`,
+        features = excluded.features,
+        latency_buckets = excluded.latency_buckets`,
     )
       .bind(
         instanceId, eventRaw, version,
@@ -214,6 +219,7 @@ async function handleReport(request, env) {
         domainHash,
         errorCount24h, apiSuccessCount24h, apiFailureCount24h,
         avgLatencyMs24h, activeEndpointCount, nodeVersion, osPlatform, features,
+        latencyBuckets,
       )
       .run();
 
@@ -518,12 +524,59 @@ async function handleDashboardOverview(request, env) {
   const totalRequests = (row?.successes || 0) + (row?.failures || 0);
   const errorRate = totalRequests > 0 ? ((row?.failures || 0) / totalRequests * 100).toFixed(2) : '0.00';
 
+  // Merge per-instance latency histograms and interpolate global percentiles.
+  const latRows = await env.DB.prepare(
+    `SELECT latency_buckets FROM plugin_stats
+     WHERE last_report_at >= ? AND latency_buckets IS NOT NULL`,
+  ).bind(cutoff90d).all();
+  const merged = {};
+  for (const r of (latRows?.results || [])) {
+    let buckets;
+    try { buckets = JSON.parse(r.latency_buckets); } catch { continue; }
+    if (!isRecord(buckets)) continue;
+    for (const [k, v] of Object.entries(buckets)) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) merged[k] = (merged[k] || 0) + n;
+    }
+  }
+
   return json({
     instances: row?.instance_count || 0,
     active_users_7d: row?.active_users_7d || 0,
     total_conversations: row?.total_conversations || 0,
     error_rate_percent: parseFloat(errorRate),
+    latency_p50_ms: percentileFromBuckets(merged, 0.5),
+    latency_p95_ms: percentileFromBuckets(merged, 0.95),
+    latency_p99_ms: percentileFromBuckets(merged, 0.99),
   });
+}
+
+// Histogram upper bounds (ms) — must match the plugin's recordSuccess buckets.
+const LATENCY_BUCKET_BOUNDS = [250, 500, 1000, 2000, 5000, 10000, 20000, 30000, 60000];
+const LATENCY_INF_BOUND = 120000; // sentinel upper bound for the open-ended 'inf' bucket
+
+// Linear-interpolated percentile over a merged bucket histogram.
+function percentileFromBuckets(merged, p) {
+  const ordered = [...LATENCY_BUCKET_BOUNDS, Infinity];
+  const keyFor = (b) => (b === Infinity ? 'inf' : String(b));
+  let total = 0;
+  for (const b of ordered) total += merged[keyFor(b)] || 0;
+  if (total === 0) return null;
+
+  const target = p * total;
+  let cum = 0;
+  let lower = 0;
+  for (const b of ordered) {
+    const upper = b === Infinity ? LATENCY_INF_BOUND : b;
+    const count = merged[keyFor(b)] || 0;
+    if (count > 0 && cum + count >= target) {
+      const within = (target - cum) / count;
+      return Math.round(lower + (upper - lower) * within);
+    }
+    cum += count;
+    lower = upper;
+  }
+  return LATENCY_INF_BOUND;
 }
 
 async function handleDashboardInstances(request, env) {

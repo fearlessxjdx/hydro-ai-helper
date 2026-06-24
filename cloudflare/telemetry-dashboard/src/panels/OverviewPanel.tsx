@@ -19,11 +19,17 @@ export function OverviewPanel() {
   if (error) return <p style={{ color: '#ef4444' }}>加载失败: {error}</p>;
   if (!data) return null;
 
+  const fmtMs = (ms: number | null) => (ms == null ? '—' : ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`);
+  const latencyColor = (ms: number | null) => (ms == null ? '#6b7280' : ms > 10000 ? '#ef4444' : ms > 5000 ? '#d97706' : '#059669');
+
   const cards: { label: string; value: string | number; color: string }[] = [
     { label: '部署实例', value: data.instances, color: '#2563eb' },
     { label: '活跃用户 (7天)', value: data.active_users_7d, color: '#059669' },
     { label: '总对话数', value: data.total_conversations.toLocaleString(), color: '#7c3aed' },
     { label: 'API 错误率', value: `${data.error_rate_percent}%`, color: data.error_rate_percent > 5 ? '#ef4444' : '#059669' },
+    { label: '延迟 P50', value: fmtMs(data.latency_p50_ms), color: latencyColor(data.latency_p50_ms) },
+    { label: '延迟 P95', value: fmtMs(data.latency_p95_ms), color: latencyColor(data.latency_p95_ms) },
+    { label: '延迟 P99', value: fmtMs(data.latency_p99_ms), color: latencyColor(data.latency_p99_ms) },
   ];
 
   return (

@@ -34,6 +34,7 @@ interface TelemetryData {
   droppedErrorCount: number;
   activeEndpointCount: number;
   featureStats: FeatureStats24h[];
+  latencyBuckets: Record<string, number>;
 }
 
 /**
@@ -82,6 +83,7 @@ interface ReportPayload {
     api_success_count_24h?: number;
     api_failure_count_24h?: number;
     avg_latency_ms_24h?: number;
+    latency_buckets?: Record<string, number>;
     error_count_24h?: number;
     suppressed_error_count?: number;
     dropped_error_count?: number;
@@ -227,6 +229,7 @@ export class TelemetryService {
       droppedErrorCount: selfStats?.droppedCount ?? 0,
       activeEndpointCount: aiConfig?.endpoints.filter(e => e.enabled).length ?? 0,
       featureStats: featureStats ?? [],
+      latencyBuckets: requestStats?.latencyBuckets ?? {},
     };
   }
 
@@ -282,6 +285,7 @@ export class TelemetryService {
           api_success_count_24h: stats.apiSuccessCount24h,
           api_failure_count_24h: stats.apiFailureCount24h,
           avg_latency_ms_24h: stats.avgLatencyMs24h,
+          latency_buckets: stats.latencyBuckets,
           error_count_24h: stats.errorCount24h,
           suppressed_error_count: stats.suppressedErrorCount,
           dropped_error_count: stats.droppedErrorCount,

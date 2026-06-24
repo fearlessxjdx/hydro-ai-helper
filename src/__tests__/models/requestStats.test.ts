@@ -37,15 +37,29 @@ describe('RequestStatsModel', () => {
   });
 
   describe('recordSuccess', () => {
-    it('should increment success count and latency', async () => {
+    it('should increment success count, latency, and the latency bucket', async () => {
       await model.recordSuccess(150);
       expect(mockColl.updateOne).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
-          $inc: { successCount: 1, totalLatencyMs: 150 },
+          $inc: { successCount: 1, totalLatencyMs: 150, 'latencyBuckets.250': 1 },
         }),
         { upsert: true }
       );
+    });
+
+    it('should select the correct histogram bucket by upper bound', async () => {
+      const bucketOf = async (ms: number) => {
+        mockColl.updateOne.mockClear();
+        await model.recordSuccess(ms);
+        const inc = mockColl.updateOne.mock.calls[0][1].$inc;
+        return Object.keys(inc).find(k => k.startsWith('latencyBuckets.'))!.split('.')[1];
+      };
+      expect(await bucketOf(250)).toBe('250');   // boundary is inclusive
+      expect(await bucketOf(251)).toBe('500');
+      expect(await bucketOf(2000)).toBe('2000');
+      expect(await bucketOf(7500)).toBe('10000');
+      expect(await bucketOf(99999)).toBe('inf');
     });
   });
 
@@ -74,6 +88,7 @@ describe('RequestStatsModel', () => {
         failureCount: 0,
         avgLatencyMs: 0,
         errorCountByCategory: {},
+        latencyBuckets: {},
       });
     });
 

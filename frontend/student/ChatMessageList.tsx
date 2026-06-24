@@ -164,7 +164,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = ({
             <div style={{ background: '#f8fafc', border: `1px solid ${A.border}`, borderRadius: '10px', padding: '8px', fontSize: '12px', maxWidth: '100%', overflow: 'hidden' }}>
               <div style={{ fontSize: '11px', color: A.textMuted, marginBottom: '4px' }}>📝 {i18n('ai_helper_student_attached_code')}</div>
               <div className="markdown-body" dangerouslySetInnerHTML={{
-                __html: renderMarkdownSafe(`\`\`\`\n${msg.code.length > 500 ? msg.code.substring(0, 500) + `\n// ... ${i18n('ai_helper_student_code_truncated')}` : msg.code}\n\`\`\``).innerHTML,
+                __html: renderMarkdownSafe(`\`\`\`\n${msg.code.length > 500 ? msg.code.substring(0, 500) + `\n// ... ${i18n('ai_helper_student_code_truncated')}` : msg.code}\n\`\`\``),
               }} />
             </div>
           )}

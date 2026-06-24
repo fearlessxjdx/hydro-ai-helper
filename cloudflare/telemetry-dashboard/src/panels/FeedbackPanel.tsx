@@ -165,6 +165,36 @@ export function FeedbackPanel() {
                     <span>v{fb.version}</span>
                     {fb.contact_email && <span>联系: {fb.contact_email}</span>}
                   </div>
+                  {fb.related_errors && fb.related_errors.length > 0 && (
+                    <details style={{ marginTop: 8 }}>
+                      <summary style={{ cursor: 'pointer', fontSize: '12px', color: '#dc2626', fontWeight: 600 }}>
+                        关联错误 ({fb.related_errors.length}) — 该实例提交反馈前后的错误
+                      </summary>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
+                        {fb.related_errors.map((e, i) => (
+                          <div key={i} style={{
+                            padding: '8px 10px', background: '#fff', borderRadius: 6,
+                            border: '1px solid #fee2e2', fontSize: '12px',
+                          }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                              <span style={{
+                                padding: '1px 6px', borderRadius: 4, fontSize: '11px', fontWeight: 600,
+                                background: '#fef2f2', color: '#ef4444',
+                              }}>
+                                {e.category}
+                              </span>
+                              <span style={{ color: '#6b7280' }}>{e.error_type}</span>
+                              <span style={{ marginLeft: 'auto', color: '#9ca3af' }}>
+                                ×{e.count} · {new Date(e.last_seen).toLocaleString()}
+                              </span>
+                            </div>
+                            <div style={{ color: '#374151', wordBreak: 'break-word' }}>{e.message || '(无消息)'}</div>
+                            <code style={{ fontSize: '11px', color: '#9ca3af' }}>{e.stack_fingerprint}</code>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                 </div>
               );
             })}

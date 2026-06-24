@@ -29,6 +29,15 @@ export interface ErrorGroup {
   versions?: string;
 }
 
+export interface RelatedError {
+  stack_fingerprint: string;
+  error_type: string;
+  category: string;
+  message: string | null;
+  count: number;
+  last_seen: string;
+}
+
 export interface FeedbackItem {
   id: number;
   instance_id: string;
@@ -38,6 +47,7 @@ export interface FeedbackItem {
   body: string | null;
   contact_email: string | null;
   received_at: string;
+  related_errors?: RelatedError[];
 }
 
 export interface FeatureHealth {

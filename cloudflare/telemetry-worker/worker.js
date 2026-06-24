@@ -618,7 +618,56 @@ async function handleDashboardFeedback(request, env) {
      ORDER BY received_at DESC LIMIT ? OFFSET ?`,
   ).bind(limit, offset).all();
 
-  return json({ feedback: rows?.results || [] });
+  const feedback = rows?.results || [];
+  const enriched = await attachRelatedErrors(feedback, env);
+  return json({ feedback: enriched });
+}
+
+// Link each feedback item to the errors its instance was seeing around the time
+// it was submitted (same instance_id, received_at within [-7d, +1d] of the
+// feedback). Works retroactively on existing data — no plugin change needed.
+async function attachRelatedErrors(feedback, env) {
+  const WINDOW_BEFORE_MS = 7 * 24 * 60 * 60 * 1000;
+  const WINDOW_AFTER_MS = 1 * 24 * 60 * 60 * 1000;
+  const MAX_PER_FEEDBACK = 5;
+
+  const instanceIds = [...new Set(feedback.map((f) => f.instance_id).filter(Boolean))];
+  if (instanceIds.length === 0) return feedback;
+
+  // plugin_errors is retained ~30d; widen slightly to cover the lookback window.
+  const cutoff = new Date(Date.now() - 37 * 24 * 60 * 60 * 1000).toISOString();
+  const placeholders = instanceIds.map(() => '?').join(',');
+  const errRows = await env.DB.prepare(
+    `SELECT instance_id, stack_fingerprint, error_type, category, message, count, last_seen, received_at
+     FROM plugin_errors
+     WHERE instance_id IN (${placeholders}) AND received_at >= ?
+     ORDER BY received_at DESC`,
+  ).bind(...instanceIds, cutoff).all();
+
+  const byInstance = new Map();
+  for (const e of (errRows?.results || [])) {
+    if (!byInstance.has(e.instance_id)) byInstance.set(e.instance_id, []);
+    byInstance.get(e.instance_id).push(e);
+  }
+
+  return feedback.map((fb) => {
+    const fbTime = new Date(fb.received_at).getTime();
+    const candidates = (byInstance.get(fb.instance_id) || [])
+      .filter((e) => {
+        const t = new Date(e.received_at).getTime();
+        return Number.isFinite(t) && t >= fbTime - WINDOW_BEFORE_MS && t <= fbTime + WINDOW_AFTER_MS;
+      })
+      .slice(0, MAX_PER_FEEDBACK)
+      .map((e) => ({
+        stack_fingerprint: e.stack_fingerprint,
+        error_type: e.error_type,
+        category: e.category,
+        message: e.message,
+        count: e.count,
+        last_seen: e.last_seen,
+      }));
+    return { ...fb, related_errors: candidates };
+  });
 }
 
 export default {

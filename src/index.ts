@@ -162,7 +162,9 @@ const aiHelperPlugin = definePlugin<AIHelperConfig>({
     errorReporter.setRuntimeEnv({ node_version: process.version });
     (async () => {
       try {
-        const info = await db.admin().command({ buildInfo: 1 });
+        // ctx.db 是 HydroOJ 的 MongoService 包装器，本身没有 .admin()；底层原生
+        // mongodb Db 暴露在 db.db 上（this.db = client.db(...)），用它跑 buildInfo。
+        const info = await db.db.admin().command({ buildInfo: 1 });
         if (info && typeof info.version === 'string') {
           errorReporter.setRuntimeEnv({ mongodb_version: info.version });
         }

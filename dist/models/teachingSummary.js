@@ -122,6 +122,8 @@ class TeachingSummaryModel {
                 stats: data.stats,
                 findings: data.findings,
                 overallSuggestion: data.overallSuggestion,
+                homeworkText: data.homeworkText ?? '',
+                studentNames: data.studentNames ?? {},
                 deepDiveResults: data.deepDiveResults ?? {},
                 tokenUsage: data.tokenUsage,
                 generationTimeMs: data.generationTimeMs,

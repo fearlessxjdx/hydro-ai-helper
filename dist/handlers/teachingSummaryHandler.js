@@ -129,6 +129,31 @@ class TeachingSummaryHandler extends hydrooj_1.Handler {
             this.response.type = 'application/json';
         }
     }
+    /**
+     * 解析发现项涉及的学生 uid → 用户名映射（best-effort，失败不阻塞生成）
+     */
+    async resolveStudentNames(findings) {
+        const names = {};
+        try {
+            const uids = new Set();
+            for (const f of findings) {
+                for (const uid of f.evidence.affectedStudents)
+                    uids.add(uid);
+            }
+            if (uids.size === 0)
+                return names;
+            const userDocs = await this.ctx.db.collection('user')
+                .find({ _id: { $in: Array.from(uids) } }, { projection: { _id: 1, uname: 1 } })
+                .toArray();
+            for (const u of userDocs) {
+                names[String(u._id)] = u.uname || `User #${u._id}`;
+            }
+        }
+        catch (err) {
+            console.error('[TeachingSummaryHandler] resolveStudentNames failed:', err);
+        }
+        return names;
+    }
     async generateAsync(model, domainId, summaryId, contestObjId, tdoc, studentUids, teachingFocus) {
         const startTime = Date.now();
         this.ctx.get('featureStatsModel')?.recordAttempt('teaching_summary').catch(() => { });
@@ -208,7 +233,7 @@ class TeachingSummaryHandler extends hydrooj_1.Handler {
                     .filter(f => f.evidence.affectedProblems.some(pid => fillInCandidatesForPrompt.some(c => c.pid === pid)))
                     .map(f => ({
                     title: f.title,
-                    errorSignature: f.evidence.metrics.errorSignature,
+                    errorSignature: f.errorSignature,
                     affectedCount: f.evidence.affectedStudents.length,
                 }))
                 : [];
@@ -229,17 +254,15 @@ class TeachingSummaryHandler extends hydrooj_1.Handler {
                     })
                     : Promise.resolve(null),
             ]);
-            const combinedSuggestion = fillInResult
-                ? `${overallResult.text}\n\n${fillInResult.text}`
-                : overallResult.text;
             let totalPromptTokens = overallResult.tokenUsage.promptTokens
                 + (fillInResult?.tokenUsage.promptTokens ?? 0);
             let totalCompletionTokens = overallResult.tokenUsage.completionTokens
                 + (fillInResult?.tokenUsage.completionTokens ?? 0);
-            // Deep dives for findings that need them
+            // Deep dives only for primary findings — secondary ones are shown as
+            // one-liners in the UI and don't warrant an extra LLM call each
             const deepDiveResults = {};
             const problemDocMap = new Map(problemDocs.map((doc) => [doc.docId, doc]));
-            const deepDiveFindings = analysisResult.findings.filter(f => f.needsDeepDive);
+            const deepDiveFindings = analysisResult.findings.filter(f => f.needsDeepDive && !f.isSecondary);
             // Batch-fetch code samples for all deep-dive findings (avoids N+1 queries)
             if (deepDiveFindings.length > 0) {
                 await model.updateProgress(summaryId, 'deep_diving');
@@ -299,12 +322,18 @@ class TeachingSummaryHandler extends hydrooj_1.Handler {
                 totalPromptTokens += deepDiveResult.tokenUsage.promptTokens;
                 totalCompletionTokens += deepDiveResult.tokenUsage.completionTokens;
             }
-            // Save completed results
+            // Resolve student names referenced by findings so the UI can show
+            // actionable name lists instead of opaque uid counts
+            const studentNames = await this.resolveStudentNames(analysisResult.findings);
+            // Save completed results — homework is stored separately from the main
+            // suggestion so the UI can surface it as a first-class deliverable
             await model.updateProgress(summaryId, 'saving');
             await model.saveResults(summaryId, {
                 stats: analysisResult.stats,
                 findings: analysisResult.findings,
-                overallSuggestion: combinedSuggestion,
+                overallSuggestion: overallResult.text,
+                homeworkText: fillInResult?.text ?? '',
+                studentNames,
                 deepDiveResults,
                 tokenUsage: { promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens },
                 generationTimeMs: Date.now() - startTime,

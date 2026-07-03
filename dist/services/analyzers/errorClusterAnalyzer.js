@@ -81,6 +81,7 @@ function analyzeErrorClusters(records, pids, totalStudents, pidTitles) {
                 dimension: 'errorCluster',
                 severity: uids.size >= totalStudents * 0.5 ? 'high' : 'medium',
                 title: `${pidTitles?.get(pid) || `题目 ${pid}`}：${pct}% 学生遇到相同错误模式 (${statusLabel})`,
+                errorSignature: sig,
                 evidence: {
                     affectedStudents: Array.from(uids),
                     affectedProblems: [pid],

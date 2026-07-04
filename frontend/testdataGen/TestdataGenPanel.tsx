@@ -670,8 +670,9 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
     </div>
   );
 
+  // Hydro 只会为首屏已有的 .section 自动添加 visible；动态插入的面板需自行标记。
   return (
-    <div style={sectionStyle} className="section">
+    <div style={sectionStyle} className="section visible">
       <div style={headerStyle} onClick={() => setCollapsed(prev => !prev)}>
         <div style={{ display: 'flex', alignItems: 'center', gap: SPACING.sm }}>
           <span style={{ fontSize: '18px' }}>🧪</span>

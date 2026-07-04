@@ -274,7 +274,7 @@ class TestdataGenSkeletonHandler extends hydrooj_1.Handler {
                 return;
             }
             this.ctx.get('featureStatsModel')?.recordAttempt('testdata_skeleton').catch(() => { });
-            const plan = (0, testdataGenService_1.buildSkeletonPlan)(options);
+            const plan = (0, testdataGenService_1.buildSkeletonPlan)(options, extractStatementMarkdown(pdoc.content));
             this.ctx.get('featureStatsModel')?.recordSuccess('testdata_skeleton').catch(() => { });
             this.response.body = { plan };
             this.response.type = 'application/json';

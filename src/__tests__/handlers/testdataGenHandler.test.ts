@@ -244,6 +244,23 @@ describe('TestdataGenSkeletonHandler', () => {
     expect(handler.limitRate).not.toHaveBeenCalled();
   });
 
+  it('auto 模式根据题面函数标记返回含 Java 的函数题骨架', async () => {
+    mockFindOne({
+      ...PROBLEM_DOC,
+      content: '### 代码写到函数内部\n```python\ndef findPoisonedDuration(timeSeries, duration):\n    return\n```',
+    });
+    const handler = setupHandler(TestdataGenSkeletonHandler, {
+      own: true,
+      body: { problemId: 'D3102', problemKind: 'auto', caseCount: 1, languages: ['py', 'java', 'cc'] },
+    });
+    await handler.post();
+    const plan = handler.response.body.plan;
+    expect(plan.problemType).toBe('function');
+    expect(plan.files.map((f: { name: string }) => f.name)).toEqual(expect.arrayContaining([
+      'template.py', 'template.java', 'template.cc', 'compile.sh', 'config.yaml',
+    ]));
+  });
+
   it('非法选项返回 400', async () => {
     mockFindOne(PROBLEM_DOC);
     const handler = setupHandler(TestdataGenSkeletonHandler, {

@@ -32,7 +32,11 @@ exports.normalizeGenerationObject = normalizeGenerationObject;
 exports.parseGenerationResponse = parseGenerationResponse;
 exports.parseDelimitedResponse = parseDelimitedResponse;
 exports.parseAiResponse = parseAiResponse;
+exports.getMissingTemplateLanguages = getMissingTemplateLanguages;
+exports.findAssignmentStyleCaseInput = findAssignmentStyleCaseInput;
+exports.parseTemplateSections = parseTemplateSections;
 exports.assemblePlan = assemblePlan;
+exports.isLikelyFunctionProblem = isLikelyFunctionProblem;
 exports.buildSkeletonPlan = buildSkeletonPlan;
 const js_yaml_1 = __importDefault(require("js-yaml"));
 exports.SUPPORTED_TEMPLATE_LANGS = ['py', 'java', 'cc'];
@@ -311,6 +315,13 @@ function buildTestdataSystemPrompt() {
 若题面给出的是类方法签名（LeetCode 常见形式，如 class Solution: def xxx(self, s, k)），学生提交的是完整的 Solution 类：Python 模板通过 Solution().xxx(...) 调用；Java 模板本就调用 new Solution().xxx(...)；C++ 模板相应以 Solution().xxx(...) 调用。此时标程也必须写成同样的类形式。
 模板中的输入解析必须与你设计的 .in 文件格式严格一致；多语言模板之间的输入解析和输出格式必须完全等价，保证同一份 .in 在三种语言下输出一致。
 
+【.in 文件是原始标准输入，不是代码】
+- CASE:IN 节必须只包含程序运行时真正从 stdin 读到的字符。严禁写变量名、赋值号、语言字面量或说明文字。
+- 例如参数 s="1010101"、k=2，正确的 .in 是两行原始值：第一行 1010101，第二行 2；严禁写成 s = "1010101" / k = 2。
+- 数组按模板约定写成空格分隔的元素。例如 timeSeries=[1,4]、duration=2，正确的 .in 是第一行 1 4、第二行 2；严禁保留方括号、逗号、变量名和等号。
+- 字符串输入通常不带源码中的引号；只有当引号本身就是题目要求的输入字符时才保留。
+- 先确定唯一、语言无关的 stdin 文本格式，再让每一种模板都解析这一格式；不得让不同语言使用不同的 .in。
+
 【测试数据设计原则】
 1. 若题面含示例，前几个测试点必须先覆盖题面示例（输入输出与题面一字不差）。
 2. 必须包含边界组，并在 label 中写明设计意图：
@@ -357,9 +368,10 @@ template.cc 原文
 1
 
 规则：
-- TEMPLATE 节只输出用户要求的语言；传统题省略全部 TEMPLATE 节与 functionName。
+- TEMPLATE 节必须逐一输出用户要求的全部语言，一个也不能遗漏；传统题省略全部 TEMPLATE 节与 functionName。
 - 函数题的 STD 节只包含与学生提交形式一致的函数/类定义（教师可用 cat std.py template.py > check.py 本地验证）；传统题的 STD 节是完整的读写标准输入输出的程序；填空题的 STD 节是补全题面代码后的结果；教师已提供标准答案时省略 STD 节。
 - CASE 编号从 1 开始连续递增，数量以用户要求为准；每个编号必须同时给出 IN 与 OUT 两节；IN 标记中最后一段冒号之后是该测试点的设计意图（label，简体中文）。
+- CASE:IN 再次强调：只写原始 stdin，禁止出现 s =、k =、arr = [1, 2] 等源码赋值写法。
 - 各节内容为原始文本：换行就是真实换行，引号、反斜杠等一律原样书写；除标记行外不要输出任何额外说明文字；正文行不得以 @@@ 开头。
 - 所有说明性文字（ANALYSIS/NOTES/label）使用简体中文。`;
 }
@@ -386,6 +398,7 @@ function buildTestdataUserPrompt(params) {
         no: '否',
     }[options.fillInMode || 'auto'];
     const langText = options.languages.map(l => LANG_DISPLAY[l]).join('、') || '（无）';
+    const requiredTemplateSections = options.languages.map(l => `@@@TEMPLATE:${l}@@@`).join('、');
     const statement = statementMarkdown.length > exports.TESTDATA_GEN_LIMITS.MAX_STATEMENT_LENGTH
         ? `${statementMarkdown.slice(0, exports.TESTDATA_GEN_LIMITS.MAX_STATEMENT_LENGTH)}\n...（题面过长已截断）`
         : statementMarkdown;
@@ -402,6 +415,9 @@ function buildTestdataUserPrompt(params) {
         `- 数据规模：${DATA_SCALE_TEXT[options.dataScale || 'small']}`,
         `- 函数题模板语言：${langText}`,
     ];
+    if (options.problemKind !== 'traditional') {
+        lines.push(`- 若判定/指定为函数题，必须完整输出这些模板节：${requiredTemplateSections}（不得遗漏）`);
+    }
     if (options.extraRequirements?.trim()) {
         lines.push(`- 教师补充要求：${options.extraRequirements.trim()}`);
     }
@@ -444,7 +460,7 @@ function normalizeFileContent(content) {
  * 校验并规范化「已解析为对象」的生成结果（JSON 与分节文本两条解析路径共用）
  * @throws Error 结构非法时抛出（消息为中文，直接展示给教师）
  */
-function normalizeGenerationObject(obj, options) {
+function normalizeGenerationObject(obj, options, parseOptions = {}) {
     const problemType = obj.problemType === 'function' ? 'function'
         : obj.problemType === 'traditional' ? 'traditional'
             : null;
@@ -476,7 +492,10 @@ function normalizeGenerationObject(obj, options) {
         for (const lang of options.languages) {
             const t = rawTemplates[lang];
             if (typeof t !== 'string' || !t.trim()) {
-                throw new Error(`AI 未返回 ${LANG_DISPLAY[lang]} 的评测模板`);
+                if (!parseOptions.allowMissingTemplates) {
+                    throw new Error(`AI 未返回 ${LANG_DISPLAY[lang]} 的评测模板`);
+                }
+                continue;
             }
             templates[lang] = normalizeFileContent(t);
         }
@@ -509,7 +528,7 @@ function normalizeGenerationObject(obj, options) {
  * JSON 解析路径（旧契约，作为分节文本失败时的回退保留）
  * @throws Error 结构非法时抛出
  */
-function parseGenerationResponse(raw, options) {
+function parseGenerationResponse(raw, options, parseOptions = {}) {
     let parsed;
     try {
         parsed = JSON.parse(extractJsonObject(raw));
@@ -517,7 +536,7 @@ function parseGenerationResponse(raw, options) {
     catch (err) {
         throw new Error(`AI 返回内容不是有效的 JSON：${err instanceof Error ? err.message : String(err)}`);
     }
-    return normalizeGenerationObject(parsed, options);
+    return normalizeGenerationObject(parsed, options, parseOptions);
 }
 // ─── 分节文本解析（当前主契约） ──────────────────────────────────────────────
 /** 分节标记：独占一行、顶格，形如 @@@META@@@ / @@@CASE:1:IN:标签@@@ */
@@ -540,7 +559,7 @@ function trimBlankEdges(lines) {
  * 解析失败）；分节原文直出从根上消除了转义问题。
  * @throws Error 标记存在但结构非法时抛出（消息为中文，直接展示给教师）
  */
-function parseDelimitedResponse(raw, options) {
+function parseDelimitedResponse(raw, options, parseOptions = {}) {
     let text = raw.replace(/<think>[\s\S]*?<\/think>/g, '');
     // 模型偶尔会把整个响应包进代码围栏，剥掉最外层
     const fenced = text.match(/^\s*```[a-zA-Z]*\r?\n([\s\S]*?)\r?\n```\s*$/);
@@ -627,6 +646,8 @@ function parseDelimitedResponse(raw, options) {
     const cases = [];
     for (const num of caseNumbers) {
         const entry = caseMap.get(num);
+        if (!entry)
+            continue;
         if (entry.input === undefined || entry.output === undefined) {
             throw new Error(`第 ${num} 个测试点缺少 ${entry.input === undefined ? 'IN' : 'OUT'} 节，请重试`);
         }
@@ -635,22 +656,78 @@ function parseDelimitedResponse(raw, options) {
     obj.cases = cases;
     if (Object.keys(templates).length > 0)
         obj.templates = templates;
-    return normalizeGenerationObject(obj, options);
+    return normalizeGenerationObject(obj, options, parseOptions);
 }
 /**
  * 解析 AI 响应：优先分节文本（当前契约），无标记时回退 JSON（兼容旧契约/
  * 忽略格式指令的模型）。两者都失败时抛出合并后的可读错误。
  */
-function parseAiResponse(raw, options) {
-    const delimited = parseDelimitedResponse(raw, options);
+function parseAiResponse(raw, options, parseOptions = {}) {
+    const delimited = parseDelimitedResponse(raw, options, parseOptions);
     if (delimited)
         return delimited;
     try {
-        return parseGenerationResponse(raw, options);
+        return parseGenerationResponse(raw, options, parseOptions);
     }
     catch (err) {
         throw new Error(`AI 返回格式无法解析（未找到分节标记，回退 JSON 也失败）。请重试一次；若持续失败，可减少测试点数量，或改用「生成骨架文件」手动填写。技术细节：${err instanceof Error ? err.message : String(err)}`);
     }
+}
+/** 返回函数题仍缺少的模板语言。 */
+function getMissingTemplateLanguages(response, options) {
+    if (response.problemType !== 'function')
+        return [];
+    return options.languages.filter(lang => !response.templates?.[lang]?.trim());
+}
+/**
+ * 检测把函数参数写成源码赋值语句的伪 stdin，例如 `s = "101"`。
+ * 要求等号至少一侧有空白，避免把题目本来就允许的原始字符串 `a=1`
+ * 误判为赋值语句。
+ */
+const ASSIGNMENT_STYLE_INPUT_RE = /^\s*(?:(?:const|let|var)\s+)?[A-Za-z_][A-Za-z0-9_]*(?:\s*:\s*[^=]+)?(?:\s+=\s*|\s*=\s+).+?;?\s*$/;
+function findAssignmentStyleCaseInput(cases) {
+    for (let i = 0; i < cases.length; i++) {
+        for (const line of cases[i].input.split(/\r?\n/)) {
+            if (ASSIGNMENT_STYLE_INPUT_RE.test(line)) {
+                return { caseNumber: i + 1, line: line.trim() };
+            }
+        }
+    }
+    return null;
+}
+/**
+ * 解析“仅补模板”的 AI 响应。该响应无需重复 META/CASE，避免因完整重生成
+ * 再次截断而丢失 Java 等排在后面的模板。
+ */
+function parseTemplateSections(raw) {
+    let text = raw.replace(/<think>[\s\S]*?<\/think>/g, '');
+    const fenced = text.match(/^\s*```[a-zA-Z]*\r?\n([\s\S]*?)\r?\n```\s*$/);
+    if (fenced)
+        text = fenced[1];
+    const templates = {};
+    let currentLang = null;
+    let currentLines = [];
+    const flush = () => {
+        if (!currentLang)
+            return;
+        const content = trimBlankEdges(currentLines);
+        if (content.trim())
+            templates[currentLang] = normalizeFileContent(content);
+    };
+    for (const line of text.split(/\r?\n/)) {
+        const marker = line.match(SECTION_MARKER_RE);
+        if (marker) {
+            flush();
+            const match = marker[1].trim().match(/^TEMPLATE:(py|java|cc)$/i);
+            currentLang = match ? match[1].toLowerCase() : null;
+            currentLines = [];
+        }
+        else if (currentLang) {
+            currentLines.push(line);
+        }
+    }
+    flush();
+    return templates;
 }
 // ─── 计划组装 ─────────────────────────────────────────────────────────────────
 /**
@@ -738,16 +815,23 @@ int main() {
     // cout << yourFunction(x) << endl;
     return 0;
 }
-`,
+  `,
 };
+/** 骨架模式不调用 AI，仅用高置信题面标记判断是否为函数题。 */
+function isLikelyFunctionProblem(statementMarkdown) {
+    return /代码写到函数内部|LeetCode\s*(?:风格|style)|class\s+Solution\b[\s\S]{0,1000}\b(?:def|public|private|protected)\b/i
+        .test(statementMarkdown);
+}
 /**
  * 构建骨架计划：不调用 AI，确定性生成结构性文件与空白测试点。
  * 用作 AI 故障时的降级方案——保住最容易出错的 compile.sh / config.yaml /
  * 模板机制部分，测试数据内容由教师在预览中手动填写。
  */
-function buildSkeletonPlan(options) {
-    // 骨架模式无 AI 判断题型：auto 按传统题处理（函数题骨架需教师显式选择）
-    const problemType = options.problemKind === 'function' ? 'function' : 'traditional';
+function buildSkeletonPlan(options, statementMarkdown = '') {
+    const autoDetectedFunction = options.problemKind === 'auto' && isLikelyFunctionProblem(statementMarkdown);
+    const problemType = options.problemKind === 'function' || autoDetectedFunction
+        ? 'function'
+        : 'traditional';
     const files = [];
     for (let i = 1; i <= options.caseCount; i++) {
         files.push({ name: `${i}.in`, content: '\n', kind: 'case-in' });
@@ -777,6 +861,8 @@ function buildSkeletonPlan(options) {
     ];
     if (problemType === 'function') {
         noteParts.push('请按题目输入格式补全各语言评测模板中的 TODO 部分。');
+        if (autoDetectedFunction)
+            noteParts.push('已根据题面中的函数题标记自动生成函数题骨架。');
     }
     else if (options.problemKind === 'auto') {
         noteParts.push('题型未指定，已按传统题生成；如需函数题骨架（模板 + compile.sh），请将题目类型选为"函数题"后重新生成。');
@@ -789,6 +875,35 @@ function buildSkeletonPlan(options) {
         caseCount: options.caseCount,
     };
 }
+function buildCaseInputRepairPrompt(issue, options) {
+    const requiredTemplates = options.languages.map(lang => `@@@TEMPLATE:${lang}@@@`).join('、');
+    return `你上一条结果中的第 ${issue.caseNumber} 个 CASE:IN 含有源码赋值写法：${issue.line}
+这不是合法的评测输入文件。请重新输出【完整的分节结果】，并修正所有测试点及模板：
+1. 每个 CASE:IN 只保留程序从 stdin 实际读取的原始值，禁止变量名、等号、方括号/逗号等语言字面量包装和说明文字。
+2. 例如 s="1010101"、k=2 必须写成两行 1010101 和 2；数组 [1,4] 必须按模板写成 1 4。
+3. 同步修改所有语言模板，使其解析修正后的同一份原始 stdin。
+4. 函数题必须包含全部所选模板节：${requiredTemplates}，一个也不能遗漏。
+5. 仍使用 @@@ 标记格式，不要输出 JSON 或代码围栏。`;
+}
+function buildTemplateRepairPrompt(missing) {
+    const sections = missing.map(lang => `@@@TEMPLATE:${lang}@@@`).join('、');
+    return `你上一条函数题结果缺少这些必需模板节：${sections}。
+请只补充上述缺失模板，不要重复 META、STD、CASE 或其他模板。要求：
+1. 每个模板节都必须出现且包含完整可编译/可运行的驱动代码。
+2. 模板必须读取你上一条结果中 CASE:IN 的原始 stdin 格式，调用题面要求的学生函数/类，并打印与 CASE:OUT 一致的结果。
+3. Java 模板必须是 public class Main，并调用学生提交的 class Solution；C++ 模板通过 #include "foo.cc" 引入学生代码；Python 模板只含驱动代码。
+4. 只使用 @@@TEMPLATE:语言@@@ 标记和源码原文，不要输出 JSON、代码围栏或解释文字。`;
+}
+function mergeTokenUsage(usages) {
+    const present = usages.filter((usage) => Boolean(usage));
+    if (present.length === 0)
+        return undefined;
+    return present.reduce((sum, usage) => ({
+        promptTokens: sum.promptTokens + usage.promptTokens,
+        completionTokens: sum.completionTokens + usage.completionTokens,
+        totalTokens: sum.totalTokens + usage.totalTokens,
+    }), { promptTokens: 0, completionTokens: 0, totalTokens: 0 });
+}
 class TestdataGenService {
     constructor(aiClient) {
         this.aiClient = aiClient;
@@ -799,16 +914,79 @@ class TestdataGenService {
     async generate(params) {
         const systemPrompt = buildTestdataSystemPrompt();
         const userPrompt = buildTestdataUserPrompt(params);
-        const result = await this.aiClient.chat([{ role: 'user', content: userPrompt }], systemPrompt, {
+        const callOptions = {
             signal: params.signal,
             // 正确性优先的长输出场景：不限制 max_tokens，超时放宽到 10 分钟/次
             maxTokens: null,
             timeoutMs: exports.TESTDATA_GEN_LIMITS.AI_TIMEOUT_MS,
-        });
-        const response = parseAiResponse(result.content, params.options);
+        };
+        const initialResult = await this.aiClient.chat([{ role: 'user', content: userPrompt }], systemPrompt, callOptions);
+        const results = [initialResult];
+        // 先宽松解析：完整结果很长，部分模型偶尔会漏掉排在后面的某个语言模板。
+        // 保留已生成的测试点，仅对缺失模板发起小体量补全，避免整份重生成再次截断。
+        let response = parseAiResponse(initialResult.content, params.options, { allowMissingTemplates: true });
+        const assignmentIssue = response.problemType === 'function'
+            ? findAssignmentStyleCaseInput(response.cases)
+            : null;
+        if (assignmentIssue) {
+            let repairResult;
+            try {
+                repairResult = await this.aiClient.chat([
+                    { role: 'user', content: userPrompt },
+                    { role: 'assistant', content: initialResult.content },
+                    { role: 'user', content: buildCaseInputRepairPrompt(assignmentIssue, params.options) },
+                ], systemPrompt, callOptions);
+            }
+            catch (err) {
+                throw new Error(`AI 生成的 .in 使用了“变量名 = 值”的错误格式，自动修复请求又失败了。`
+                    + `请重试；若 AI 服务持续不可用，可用「生成骨架文件（不调用 AI）」手动填写。技术细节：${err instanceof Error ? err.message : String(err)}`);
+            }
+            results.push(repairResult);
+            try {
+                response = parseAiResponse(repairResult.content, params.options);
+                const remainingIssue = response.problemType === 'function'
+                    ? findAssignmentStyleCaseInput(response.cases)
+                    : null;
+                if (remainingIssue) {
+                    throw new Error(`第 ${remainingIssue.caseNumber} 个 .in 仍含错误写法：${remainingIssue.line}`);
+                }
+            }
+            catch (err) {
+                throw new Error(`AI 自动修复 .in 格式后仍未返回可用的完整文件计划。请重试；若持续失败，可用「生成骨架文件（不调用 AI）」手动填写。技术细节：${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+        else {
+            const missingTemplates = getMissingTemplateLanguages(response, params.options);
+            if (missingTemplates.length > 0) {
+                let repairResult;
+                try {
+                    repairResult = await this.aiClient.chat([
+                        { role: 'user', content: userPrompt },
+                        { role: 'assistant', content: initialResult.content },
+                        { role: 'user', content: buildTemplateRepairPrompt(missingTemplates) },
+                    ], systemPrompt, callOptions);
+                }
+                catch (err) {
+                    throw new Error(`AI 未返回 ${missingTemplates.map(lang => LANG_DISPLAY[lang]).join('、')}，自动补全请求又失败了。`
+                        + `请重试；若 AI 服务持续不可用，可用「生成骨架文件（不调用 AI）」手动填写。技术细节：${err instanceof Error ? err.message : String(err)}`);
+                }
+                results.push(repairResult);
+                const repairedTemplates = parseTemplateSections(repairResult.content);
+                response.templates = { ...response.templates };
+                for (const lang of missingTemplates) {
+                    if (repairedTemplates[lang])
+                        response.templates[lang] = repairedTemplates[lang];
+                }
+                const stillMissing = getMissingTemplateLanguages(response, params.options);
+                if (stillMissing.length > 0) {
+                    throw new Error(`AI 补全后仍缺少 ${stillMissing.map(lang => LANG_DISPLAY[lang]).join('、')}。`
+                        + '请重试；若持续失败，可用「生成骨架文件（不调用 AI）」手动填写。');
+                }
+            }
+        }
         const plan = assemblePlan(response, params.options);
-        plan.tokenUsage = result.usage;
-        plan.usedModel = `${result.usedModel.endpointName}/${result.usedModel.modelName}`;
+        plan.tokenUsage = mergeTokenUsage(results.map(result => result.usage));
+        plan.usedModel = [...new Set(results.map(result => `${result.usedModel.endpointName}/${result.usedModel.modelName}`))].join(' → ');
         return plan;
     }
 }

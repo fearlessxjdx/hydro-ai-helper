@@ -323,7 +323,7 @@ export class TestdataGenSkeletonHandler extends Handler {
       }
 
       this.ctx.get('featureStatsModel')?.recordAttempt('testdata_skeleton').catch(() => { /* best-effort */ });
-      const plan = buildSkeletonPlan(options);
+      const plan = buildSkeletonPlan(options, extractStatementMarkdown(pdoc.content));
       this.ctx.get('featureStatsModel')?.recordSuccess('testdata_skeleton').catch(() => { /* best-effort */ });
 
       this.response.body = { plan };

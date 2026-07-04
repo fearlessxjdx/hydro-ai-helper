@@ -13,6 +13,9 @@ import {
   parseGenerationResponse,
   parseDelimitedResponse,
   parseAiResponse,
+  parseTemplateSections,
+  getMissingTemplateLanguages,
+  findAssignmentStyleCaseInput,
   assemblePlan,
   buildTestdataSystemPrompt,
   buildTestdataUserPrompt,
@@ -274,6 +277,15 @@ describe('parseGenerationResponse', () => {
     )).toThrow(/模板/);
   });
 
+  it('服务层可宽松解析缺失模板，以便随后定向补全', () => {
+    const res = parseGenerationResponse(
+      makeAiJson({ templates: { py: 'x' } }),
+      fnOptions,
+      { allowMissingTemplates: true },
+    );
+    expect(getMissingTemplateLanguages(res, fnOptions)).toEqual(['java', 'cc']);
+  });
+
   it('用户指定题型时覆盖 AI 判断', () => {
     const res = parseGenerationResponse(
       makeAiJson({ problemType: 'function' }),
@@ -451,6 +463,31 @@ describe('parseAiResponse', () => {
   });
 });
 
+describe('函数题生成结果防线', () => {
+  it('识别把参数赋值语句写进 .in 的错误格式', () => {
+    expect(findAssignmentStyleCaseInput([
+      { input: 's = "1010101"\nk = 2\n', output: '12\n' },
+    ])).toEqual({ caseNumber: 1, line: 's = "1010101"' });
+  });
+
+  it('不把不含空白等号的原始字符串误判为赋值语句', () => {
+    expect(findAssignmentStyleCaseInput([
+      { input: 'a=1\n', output: 'ok\n' },
+    ])).toBeNull();
+  });
+
+  it('解析定向补全返回的单个 Java 模板节', () => {
+    const templates = parseTemplateSections([
+      '@@@TEMPLATE:java@@@',
+      'public class Main {',
+      '    public static void main(String[] args) {}',
+      '}',
+    ].join('\n'));
+    expect(templates.java).toContain('public class Main');
+    expect(templates.py).toBeUndefined();
+  });
+});
+
 // ─── assemblePlan ─────────────────────────────────────────────────────────────
 
 describe('assemblePlan', () => {
@@ -524,6 +561,8 @@ describe('buildTestdataSystemPrompt / buildTestdataUserPrompt', () => {
     expect(sp).toContain('禁止 JSON');
     // 类方法签名（LeetCode class Solution 形式）的调用约定
     expect(sp).toContain('Solution().xxx(...)');
+    expect(sp).toContain('.in 文件是原始标准输入，不是代码');
+    expect(sp).toContain('严禁写成 s = "1010101" / k = 2');
   });
 
   it('System Prompt 包含填空题、标准答案与数据规模规则', () => {
@@ -547,6 +586,7 @@ describe('buildTestdataSystemPrompt / buildTestdataUserPrompt', () => {
     expect(up).toContain('# 题目');
     expect(up).toContain('5 个');
     expect(up).toContain('Python (template.py)');
+    expect(up).toContain('@@@TEMPLATE:py@@@');
     expect(up).toContain('链表用类实现');
     expect(up).toContain('1.in, config.yaml');
   });
@@ -628,6 +668,19 @@ describe('buildSkeletonPlan', () => {
     expect(plan.notes).toContain('题型未指定');
   });
 
+  it('auto 模式从高置信题面标记识别函数题并生成全部模板骨架', () => {
+    const statement = '### 代码写到函数内部\n```python\ndef findPoisonedDuration(timeSeries, duration):\n    return\n```';
+    const plan = buildSkeletonPlan(
+      { problemKind: 'auto', caseCount: 1, languages: ['py', 'java', 'cc'] },
+      statement,
+    );
+    expect(plan.problemType).toBe('function');
+    expect(plan.files.map(f => f.name)).toEqual(expect.arrayContaining([
+      'template.py', 'template.java', 'template.cc', 'compile.sh', 'config.yaml',
+    ]));
+    expect(plan.notes).toContain('自动生成函数题骨架');
+  });
+
   it('提供标准答案时随骨架一并写入 std 文件', () => {
     const plan = buildSkeletonPlan({
       problemKind: 'traditional', caseCount: 1, languages: [],
@@ -667,6 +720,72 @@ describe('TestdataGenService.generate', () => {
     expect(plan.files.map(f => f.name)).toContain('config.yaml');
     expect(plan.tokenUsage?.totalTokens).toBe(300);
     expect(plan.usedModel).toBe('main/gpt-test');
+  });
+
+  it('AI 漏掉 Java 模板时定向补全并保留原测试点', async () => {
+    const initial = makeDelimitedResponse().replace(
+      /@@@TEMPLATE:java@@@[\s\S]*?(?=@@@TEMPLATE:cc@@@)/,
+      '',
+    );
+    const mockClient = {
+      chat: jest.fn()
+        .mockResolvedValueOnce({
+          content: initial,
+          usage: { promptTokens: 100, completionTokens: 200, totalTokens: 300 },
+          usedModel: { endpointId: 'ep1', endpointName: 'main', modelName: 'gpt-test' },
+        })
+        .mockResolvedValueOnce({
+          content: [
+            '@@@TEMPLATE:java@@@',
+            'public class Main {',
+            '    public static void main(String[] args) {',
+            '        System.out.println(new Solution().countKConstraintSubstrings("10101", 1));',
+            '    }',
+            '}',
+          ].join('\n'),
+          usage: { promptTokens: 20, completionTokens: 30, totalTokens: 50 },
+          usedModel: { endpointId: 'ep1', endpointName: 'main', modelName: 'gpt-test' },
+        }),
+    };
+    const options: GenerateOptions = {
+      problemKind: 'function', caseCount: 2, languages: ['py', 'java', 'cc'],
+    };
+    const plan = await new TestdataGenService(mockClient as never).generate({
+      problemTitle: '约束子串', statementMarkdown: '题面', options,
+    });
+
+    expect(mockClient.chat).toHaveBeenCalledTimes(2);
+    expect(mockClient.chat.mock.calls[1][0][2].content).toContain('@@@TEMPLATE:java@@@');
+    expect(plan.files.find(f => f.name === 'template.java')?.content).toContain('public class Main');
+    expect(plan.files.find(f => f.name === '1.in')?.content).toBe('10101\n1\n');
+    expect(plan.tokenUsage?.totalTokens).toBe(350);
+  });
+
+  it('AI 把变量赋值写入 .in 时要求完整修复后再组装', async () => {
+    const invalid = makeDelimitedResponse().replace(
+      '@@@CASE:1:IN:样例1@@@\n10101\n1',
+      '@@@CASE:1:IN:样例1@@@\ns = "10101"\nk = 1',
+    );
+    const mockClient = {
+      chat: jest.fn()
+        .mockResolvedValueOnce({
+          content: invalid,
+          usedModel: { endpointId: 'ep1', endpointName: 'main', modelName: 'gpt-test' },
+        })
+        .mockResolvedValueOnce({
+          content: makeDelimitedResponse(),
+          usedModel: { endpointId: 'ep1', endpointName: 'main', modelName: 'gpt-test' },
+        }),
+    };
+    const plan = await new TestdataGenService(mockClient as never).generate({
+      problemTitle: '约束子串',
+      statementMarkdown: '题面',
+      options: { problemKind: 'function', caseCount: 2, languages: ['py', 'java', 'cc'] },
+    });
+
+    expect(mockClient.chat).toHaveBeenCalledTimes(2);
+    expect(mockClient.chat.mock.calls[1][0][2].content).toContain('不是合法的评测输入文件');
+    expect(plan.files.find(f => f.name === '1.in')?.content).toBe('10101\n1\n');
   });
 
   it('AI 返回非法内容时抛出中文错误', async () => {

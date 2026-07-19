@@ -1,8 +1,7 @@
-<!--
-  This file IS the GitHub Release body (the publish workflow reads it via
-  body_path). Auto-generation is disabled on purpose. Keep it user-facing and
-  update it before each release tag.
--->
+# 更新日志
+
+本文件保存各版本的累计更新记录。发布工作流会根据当前 Git 标签提取对应版本的章节，GitHub Release 中只显示该版本的内容。
+
 ## v3.0.4
 
 - **提高 AI 测试数据生成成功率**：自动清理模型在 `GENERATOR`、`ORACLE`、`BRUTE`、`VALIDATOR`、`SOLUTION`、函数模板及教师标准答案外层误加的 Markdown 代码围栏，避免围栏标记被送入沙箱后直接触发 `SyntaxError`。
@@ -11,6 +10,13 @@
 - **限制异常大测试数据并提高沙箱响应容量**：单个输入/输出限制为 256KB、生成制品总量限制为 1MB，同时按批次实际规模提高 go-judge 响应上限，减少超大数据造成的超时与 `maxContentLength` 误报。
 - **增强问题诊断**：遥测会记录失败阶段、实际使用的模型链和 AI 尝试次数，并避免不同功能经过相同调用栈时被错误合并，便于判断是模型生成问题还是程序验证问题。
 - 升级后请重启 Hydro，以加载新后端代码并重建前端资源；无需新增配置或数据库迁移。
+
+## v3.0.3
+
+- 测试数据规模默认改为自动混合：按题面约束覆盖小、中、临界规模，并在预览页展示每个测试点的规模与覆盖目标。
+- 新生成的数据会避开已有数字测试点编号，并把已有完整 `.in/.out` 与新测试点共同合并进 `config.yaml`，避免覆盖旧数据或遗漏评测配置。
+- 沙箱失败改为按生成器、标程、暴力对拍或函数模板定向修复；蓝图首次解析失败时也会自动请求完整修复。
+- 遥测告警新增测试数据生成错误突增检测，便于及时发现实例侧集中失败。
 
 ## v3.0.2
 

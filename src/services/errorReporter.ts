@@ -315,7 +315,10 @@ export class ErrorReporter {
     // 整段 stack 会把同一代码路径拆成大量指纹，淹没错误面板与告警规则。
     // 只使用脱敏后的调用帧；无可用帧时按错误类型/类别稳定聚合。
     const frames = this.sanitizeStack(stack) || [];
-    let source = frames.length > 0 ? frames.join('\n') : `${errorType}:${category}`;
+    // errorType/category 必须始终参与哈希：不同业务类别可能经过同一个
+    // Handler catch 路径，若只哈希调用帧会在平台端被错误合并。
+    let source = `${errorType}:${category}`;
+    if (frames.length > 0) source += `:${frames.join('\n')}`;
     if (discriminator) source += `:${discriminator}`;
     return createHash('sha256')
       .update(source)

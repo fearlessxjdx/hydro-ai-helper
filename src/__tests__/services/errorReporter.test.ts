@@ -152,6 +152,17 @@ describe('ErrorReporter', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       expect((reporter as any).buffer.size).toBe(2);
     });
+
+    it('keeps different categories separate even when stack frames match', () => {
+      const stack = [
+        'Error: dynamic',
+        '    at Handler.post (dist/handlers/sharedHandler.js:50:10)',
+      ].join('\n');
+      reporter.capture('api_failure', 'testdata_gen', 'generation failed', undefined, stack);
+      reporter.capture('api_failure', 'student_chat', 'chat failed', undefined, stack);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((reporter as any).buffer.size).toBe(2);
+    });
   });
 
   describe('sanitized stack frames + runtime env (P1)', () => {

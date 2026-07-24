@@ -6,7 +6,7 @@
  * 后端在写入 config.yaml 后由 HydroOJ 自动同步评测设置。
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { i18n } from '../utils/i18n';
 import { buildApiUrl } from '../utils/domainUtils';
 import {
@@ -33,7 +33,11 @@ interface ProblemContext {
     isOwn: boolean;
   }>;
   limits: { minCases: number; maxCases: number; maxExtraRequirements: number; maxProvidedStd?: number };
+  generationProfiles?: Record<GenerationProfile, { aiTimeoutMs: number; totalTimeoutMs: number }>;
+  restorableJob?: BackgroundGenerationJob;
 }
+
+type GenerationProfile = 'standard' | 'hard';
 
 interface PlannedFile {
   name: string;
@@ -78,6 +82,36 @@ interface GenerationPlan {
   verification?: PlanVerification;
 }
 
+type BackgroundGenerationJobStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'canceled'
+  | 'interrupted';
+
+interface BackgroundGenerationJob {
+  id: string;
+  problemId: string;
+  problemTitle: string;
+  generationProfile: GenerationProfile;
+  status: BackgroundGenerationJobStatus;
+  progress: GenerationProgressEvent;
+  error?: {
+    message: string;
+    code: string;
+    category?: string;
+    retryable: boolean;
+    recommendDeeperReasoning?: boolean;
+  };
+  plan?: GenerationPlan;
+  createdAt: string;
+  startedAt?: string | null;
+  updatedAt: string;
+  progressUpdatedAt: string;
+  completedAt?: string | null;
+}
+
 type GenerationProgressStage =
   | 'preparing'
   | 'sandbox_check'
@@ -94,6 +128,7 @@ type GenerationProgressStage =
   | 'checking_templates'
   | 'stress_testing'
   | 'pipeline_repair'
+  | 'model_fallback'
   | 'model_escalation'
   | 'assembling'
   | 'complete';
@@ -154,10 +189,17 @@ const PROGRESS_STAGE_CAPS: Record<GenerationProgressStage, number> = {
   checking_templates: 84,
   stress_testing: 90,
   pipeline_repair: 94,
+  model_fallback: 60,
   model_escalation: 94,
   assembling: 98,
   complete: 100,
 };
+
+const DEFAULT_GENERATION_PROFILES: Record<GenerationProfile, { aiTimeoutMs: number; totalTimeoutMs: number }> = {
+  standard: { aiTimeoutMs: 600_000, totalTimeoutMs: 900_000 },
+  hard: { aiTimeoutMs: 1_200_000, totalTimeoutMs: 1_800_000 },
+};
+const JOB_POLL_INTERVAL_MS = 2_000;
 
 // deterministic 用中性灰：getBadgeStyle 无 neutral 变体，借 info 外形覆盖配色
 const getOriginBadgeStyle = (origin: string): React.CSSProperties => {
@@ -198,83 +240,6 @@ async function parseErrorDetails(response: Response): Promise<ApiErrorDetails> {
   return { message: `HTTP ${response.status}`, recommendDeeperReasoning: false };
 }
 
-async function consumeGenerationProgressStream(
-  response: Response,
-  onProgress: (progress: GenerationProgressEvent) => void,
-): Promise<GenerationPlan> {
-  if (!response.body) throw new Error(i18n('ai_helper_testdata_progress_stream_missing'));
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let eventName = '';
-  let dataLines: string[] = [];
-  let result: GenerationPlan | null = null;
-  let streamError: TestdataRequestError | null = null;
-
-  const dispatch = () => {
-    if (!eventName || dataLines.length === 0) {
-      eventName = '';
-      dataLines = [];
-      return;
-    }
-    let data: any;
-    try { data = JSON.parse(dataLines.join('\n')); } catch {
-      eventName = '';
-      dataLines = [];
-      return;
-    }
-    if (eventName === 'progress'
-      && typeof data?.stage === 'string'
-      && Number.isFinite(Number(data?.percent))) {
-      onProgress({
-        stage: data.stage as GenerationProgressStage,
-        percent: Number(data.percent),
-        attempt: Number(data.attempt) > 1 ? Number(data.attempt) : 1,
-      });
-    } else if (eventName === 'result' && data?.plan) {
-      result = data.plan as GenerationPlan;
-    } else if (eventName === 'error') {
-      streamError = new TestdataRequestError(
-        String(data?.error || i18n('ai_helper_testdata_err_empty_plan')),
-        data?.recommendDeeperReasoning === true,
-      );
-    }
-    eventName = '';
-    dataLines = [];
-  };
-
-  const processLine = (rawLine: string) => {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
-    if (line === '') {
-      dispatch();
-    } else if (line.startsWith('event:')) {
-      eventName = line.slice(6).trim();
-    } else if (line.startsWith('data:')) {
-      dataLines.push(line.slice(5).trimStart());
-    }
-  };
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      lines.forEach(processLine);
-    }
-    buffer += decoder.decode();
-    if (buffer) processLine(buffer);
-    dispatch();
-  } finally {
-    reader.releaseLock();
-  }
-
-  if (streamError) throw streamError;
-  if (!result) throw new Error(i18n('ai_helper_testdata_err_empty_plan'));
-  return result;
-}
-
 // ─── 组件 ─────────────────────────────────────────────────────────────────────
 
 export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId }) => {
@@ -294,8 +259,16 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
     stage: 'preparing', percent: 2, attempt: 1, source: 'estimated',
   });
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0);
+  const [generationIdleSeconds, setGenerationIdleSeconds] = useState(0);
+  const [generationCanceling, setGenerationCanceling] = useState(false);
+  const generationStartedAtRef = useRef(0);
+  const generationLastEventAtRef = useRef(0);
+  const [generationJobId, setGenerationJobId] = useState<string | null>(null);
+  const restoreCheckedRef = useRef(false);
+  const jobStorageKey = `ai-helper:testdata-generation-job:${window.location.pathname}:${problemId}`;
 
   // 表单状态
+  const [generationProfile, setGenerationProfile] = useState<GenerationProfile>('standard');
   const [problemKind, setProblemKind] = useState<'auto' | 'traditional' | 'function'>('auto');
   const [fillInMode, setFillInMode] = useState<'auto' | 'yes' | 'no'>('auto');
   const [caseCount, setCaseCount] = useState(10);
@@ -312,14 +285,45 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
   const [activeFile, setActiveFile] = useState<string | null>(null);
   const [applyResult, setApplyResult] = useState<{ written: string[]; failed: Array<{ name: string; error: string }> } | null>(null);
 
-  // 实时事件之间让进度缓慢前移；旧后端无 SSE 时则按等待时长给出保守估算，最高不超过 88%。
+  const rememberJob = useCallback((jobId: string | null) => {
+    setGenerationJobId(jobId);
+    try {
+      if (jobId) window.localStorage.setItem(jobStorageKey, jobId);
+      else window.localStorage.removeItem(jobStorageKey);
+    } catch { /* localStorage may be unavailable in strict privacy mode */ }
+  }, [jobStorageKey]);
+
+  const loadPlanIntoPreview = useCallback((newPlan: GenerationPlan) => {
+    if (!newPlan || !Array.isArray(newPlan.files) || newPlan.files.length === 0) {
+      throw new Error(i18n('ai_helper_testdata_err_empty_plan'));
+    }
+    const contents: Record<string, string> = {};
+    const selected: Record<string, boolean> = {};
+    for (const f of newPlan.files) {
+      contents[f.name] = f.content;
+      selected[f.name] = true;
+    }
+    setPlan(newPlan);
+    setFileContents(contents);
+    setSelectedFiles(selected);
+    setActiveFile(newPlan.files[0].name);
+    setApplyResult(null);
+    setPhase('preview');
+  }, []);
+
+  // 后台阶段事件之间让进度缓慢前移；百分比始终是阶段估算，最高不超过当前阶段上限。
   useEffect(() => {
     if (phase !== 'generating') return undefined;
-    const startedAt = Date.now();
+    const startedAt = generationStartedAtRef.current || Date.now();
+    generationStartedAtRef.current = startedAt;
+    if (!generationLastEventAtRef.current) generationLastEventAtRef.current = startedAt;
     setGenerationElapsedSeconds(0);
+    setGenerationIdleSeconds(0);
     const timer = window.setInterval(() => {
-      const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      const now = Date.now();
+      const elapsed = Math.max(0, Math.floor((now - startedAt) / 1000));
       setGenerationElapsedSeconds(elapsed);
+      setGenerationIdleSeconds(Math.max(0, Math.floor((now - generationLastEventAtRef.current) / 1000)));
       setGenerationProgress(prev => {
         if (prev.source === 'live') {
           const cap = PROGRESS_STAGE_CAPS[prev.stage] ?? 98;
@@ -379,6 +383,112 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
     return () => { cancelled = true; };
   }, [problemId, contextReloadKey]);
 
+  // 服务端记录优先，localStorage 用于在结果刚完成但上下文尚未刷新时补充恢复。
+  useEffect(() => {
+    if (!context || restoreCheckedRef.current || phase !== 'form' || plan) return;
+    restoreCheckedRef.current = true;
+    let storedJobId = '';
+    try { storedJobId = window.localStorage.getItem(jobStorageKey) || ''; } catch { /* ignore */ }
+    const savedJob = context.restorableJob;
+    const jobId = savedJob?.id || storedJobId;
+    if (!jobId) return;
+
+    rememberJob(jobId);
+    if (savedJob?.generationProfile) setGenerationProfile(savedJob.generationProfile);
+    const startedAt = Date.parse(savedJob?.startedAt || savedJob?.createdAt || '');
+    const progressAt = Date.parse(savedJob?.progressUpdatedAt || '');
+    generationStartedAtRef.current = Number.isFinite(startedAt) ? startedAt : Date.now();
+    generationLastEventAtRef.current = Number.isFinite(progressAt)
+      ? progressAt
+      : generationStartedAtRef.current;
+    if (savedJob?.progress) {
+      setGenerationProgress({ ...savedJob.progress, source: 'live' });
+    }
+    setCollapsed(false);
+    setPhase('generating');
+  }, [context, phase, plan, jobStorageKey, rememberJob]);
+
+  // 轮询持久任务。短暂网络故障只会让页面少一次更新，不会中断后台模型调用。
+  useEffect(() => {
+    if (!generationJobId || phase !== 'generating') return undefined;
+    let disposed = false;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      let terminal = false;
+      try {
+        const response = await fetch(
+          buildApiUrl(`/ai-helper/testdata-gen/jobs/${encodeURIComponent(generationJobId)}`),
+          { credentials: 'include' },
+        );
+        if (!response.ok) {
+          const details = await parseErrorDetails(response);
+          if (response.status === 404 || response.status === 403) {
+            throw new TestdataRequestError(details.message);
+          }
+          throw new Error(details.message);
+        }
+        const data = await response.json() as { job: BackgroundGenerationJob };
+        if (disposed || !data.job) return;
+        const job = data.job;
+        setGenerationProfile(job.generationProfile);
+        const startedAt = Date.parse(job.startedAt || job.createdAt || '');
+        const progressAt = Date.parse(job.progressUpdatedAt || '');
+        if (Number.isFinite(startedAt)) generationStartedAtRef.current = startedAt;
+        if (Number.isFinite(progressAt)) generationLastEventAtRef.current = progressAt;
+        if (job.progress) {
+          setGenerationProgress(prev => ({
+            ...job.progress,
+            percent: Math.max(prev.percent, Math.min(100, job.progress.percent)),
+            source: 'live',
+          }));
+        }
+
+        if (job.status === 'completed') {
+          terminal = true;
+          if (!job.plan) throw new Error(i18n('ai_helper_testdata_err_empty_plan'));
+          loadPlanIntoPreview(job.plan);
+        } else if (job.status === 'failed' || job.status === 'interrupted') {
+          terminal = true;
+          rememberJob(null);
+          setError(job.error?.code === 'WORKER_INTERRUPTED'
+            ? i18n('ai_helper_testdata_job_interrupted')
+            : (job.error?.message || i18n('ai_helper_testdata_job_failed')));
+          setShowFallbackHint(true);
+          setShowDeeperReasoningHint(job.error?.recommendDeeperReasoning === true);
+          setPhase('form');
+        } else if (job.status === 'canceled') {
+          terminal = true;
+          rememberJob(null);
+          setError(i18n('ai_helper_testdata_err_canceled'));
+          setShowFallbackHint(false);
+          setPhase('form');
+        }
+      } catch (err) {
+        if (disposed) return;
+        if (terminal || err instanceof TestdataRequestError) {
+          terminal = true;
+          rememberJob(null);
+          setError(err instanceof Error ? err.message : String(err));
+          setShowFallbackHint(true);
+          setPhase('form');
+        } else {
+          console.warn('[AI-Helper] testdata generation job poll failed:', err);
+        }
+      } finally {
+        if (!disposed && !terminal) {
+          timer = window.setTimeout(poll, JOB_POLL_INTERVAL_MS);
+        }
+      }
+    };
+
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [generationJobId, phase, loadPlanIntoPreview, rememberJob]);
+
   const existingFileSet = new Set(context?.existingFiles || []);
 
   const toggleLanguage = (lang: string) => {
@@ -395,21 +505,21 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
       setError(i18n('ai_helper_testdata_err_no_languages'));
       return;
     }
+    const startedAt = Date.now();
+    generationStartedAtRef.current = startedAt;
+    generationLastEventAtRef.current = startedAt;
+    setGenerationIdleSeconds(0);
+    setGenerationCanceling(false);
     setGenerationProgress({ stage: 'preparing', percent: 2, attempt: 1, source: 'estimated' });
     setPhase('generating');
-    const ac = new AbortController();
-    // 生成不设 token 上限、服务端单次超时 10 分钟，前端仅作 15 分钟最终兜底
-    const timeout = setTimeout(() => ac.abort(), 900_000);
     try {
-      const response = await fetch(buildApiUrl('/ai-helper/testdata-gen/generate'), {
+      const response = await fetch(buildApiUrl('/ai-helper/testdata-gen/jobs'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-Requested-With': 'XMLHttpRequest',
-          'Accept': 'text/event-stream, application/json',
         },
         credentials: 'include',
-        signal: ac.signal,
         body: JSON.stringify({
           problemId,
           problemKind,
@@ -420,52 +530,57 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
           providedStd: providedStd.trim() || undefined,
           acceptedStdRecordId: acceptedStdRecordId || undefined,
           extraRequirements: extraRequirements.trim() || undefined,
+          generationProfile,
         }),
       });
       if (!response.ok) {
         const details = await parseErrorDetails(response);
         throw new TestdataRequestError(details.message, details.recommendDeeperReasoning);
       }
-      const contentType = response.headers.get('content-type') || '';
-      const newPlan = contentType.includes('text/event-stream')
-        ? await consumeGenerationProgressStream(response, progress => {
-          setGenerationProgress(prev => ({
-            ...progress,
-            percent: Math.max(prev.percent, Math.min(100, progress.percent)),
-            source: 'live',
-          }));
-        })
-        : ((await response.json() as { plan: GenerationPlan }).plan);
-      if (!newPlan || !Array.isArray(newPlan.files) || newPlan.files.length === 0) {
-        throw new Error(i18n('ai_helper_testdata_err_empty_plan'));
+      const data = await response.json() as { job: BackgroundGenerationJob };
+      if (!data.job?.id) throw new Error(i18n('ai_helper_testdata_job_start_failed'));
+      rememberJob(data.job.id);
+      setGenerationProfile(data.job.generationProfile);
+      if (data.job.progress) {
+        setGenerationProgress({ ...data.job.progress, source: 'live' });
       }
-      setPlan(newPlan);
-      const contents: Record<string, string> = {};
-      const selected: Record<string, boolean> = {};
-      for (const f of newPlan.files) {
-        contents[f.name] = f.content;
-        selected[f.name] = true;
-      }
-      setFileContents(contents);
-      setSelectedFiles(selected);
-      setActiveFile(newPlan.files[0].name);
-      setApplyResult(null);
-      setPhase('preview');
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        setError(i18n('ai_helper_testdata_err_timeout'));
-      } else {
-        setError(err instanceof Error ? err.message : String(err));
-      }
+      setError(err instanceof Error ? err.message : String(err));
+      setShowFallbackHint(true);
       setShowDeeperReasoningHint(
         err instanceof TestdataRequestError && err.recommendDeeperReasoning,
       );
-      setShowFallbackHint(true);
       setPhase('form');
-    } finally {
-      clearTimeout(timeout);
     }
-  }, [problemId, problemKind, fillInMode, caseCount, dataScale, languages, providedStd, acceptedStdRecordId, extraRequirements]);
+  }, [
+    problemId, generationProfile, problemKind, fillInMode, caseCount,
+    dataScale, languages, providedStd, acceptedStdRecordId, extraRequirements,
+    rememberJob,
+  ]);
+
+  const handleCancelGeneration = useCallback(async () => {
+    if (!generationJobId || generationCanceling) return;
+    setGenerationCanceling(true);
+    try {
+      const response = await fetch(
+        buildApiUrl(`/ai-helper/testdata-gen/jobs/${encodeURIComponent(generationJobId)}/cancel`),
+        {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          credentials: 'include',
+        },
+      );
+      if (!response.ok) throw new Error((await parseErrorDetails(response)).message);
+      rememberJob(null);
+      setError(i18n('ai_helper_testdata_err_canceled'));
+      setShowFallbackHint(false);
+      setPhase('form');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setGenerationCanceling(false);
+    }
+  }, [generationJobId, generationCanceling, rememberJob]);
 
   // ─── 骨架模式（AI 故障降级） ─────────────────────────────────────────────────
 
@@ -501,27 +616,15 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
         throw new Error((await parseErrorDetails(response)).message);
       }
       const data = await response.json() as { plan: GenerationPlan };
-      const newPlan = data.plan;
-      if (!newPlan || !Array.isArray(newPlan.files) || newPlan.files.length === 0) {
-        throw new Error(i18n('ai_helper_testdata_err_empty_plan'));
-      }
-      setPlan(newPlan);
-      const contents: Record<string, string> = {};
-      const selected: Record<string, boolean> = {};
-      for (const f of newPlan.files) {
-        contents[f.name] = f.content;
-        selected[f.name] = true;
-      }
-      setFileContents(contents);
-      setSelectedFiles(selected);
-      setActiveFile(newPlan.files[0].name);
-      setApplyResult(null);
-      setPhase('preview');
+      loadPlanIntoPreview(data.plan);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setPhase('form');
     }
-  }, [problemId, problemKind, caseCount, dataScale, languages, providedStd, acceptedStdRecordId]);
+  }, [
+    problemId, problemKind, caseCount, dataScale, languages,
+    providedStd, acceptedStdRecordId, loadPlanIntoPreview,
+  ]);
 
   // ─── 写入 ───────────────────────────────────────────────────────────────────
 
@@ -550,19 +653,48 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
           'X-Requested-With': 'XMLHttpRequest',
         },
         credentials: 'include',
-        body: JSON.stringify({ problemId, files }),
+        body: JSON.stringify({ problemId, jobId: generationJobId || undefined, files }),
       });
       if (!response.ok) {
         throw new Error((await parseErrorDetails(response)).message);
       }
       const data = await response.json() as { written: string[]; failed: Array<{ name: string; error: string }> };
       setApplyResult(data);
+      if (data.failed.length === 0) rememberJob(null);
       setPhase('applied');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setPhase('preview');
     }
-  }, [plan, selectedFiles, fileContents, problemId, existingFileSet]);
+  }, [
+    plan, selectedFiles, fileContents, problemId, existingFileSet,
+    generationJobId, rememberJob,
+  ]);
+
+  const handleBackToForm = useCallback(async () => {
+    const jobId = generationJobId;
+    if (jobId) {
+      try {
+        await fetch(
+          buildApiUrl(`/ai-helper/testdata-gen/jobs/${encodeURIComponent(jobId)}/dismiss`),
+          {
+            method: 'POST',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+            credentials: 'include',
+          },
+        );
+      } catch (err) {
+        console.warn('[AI-Helper] dismiss testdata generation job failed:', err);
+      }
+    }
+    rememberJob(null);
+    setPlan(null);
+    setFileContents({});
+    setSelectedFiles({});
+    setActiveFile(null);
+    setError(null);
+    setPhase('form');
+  }, [generationJobId, rememberJob]);
 
   // ─── 渲染 ───────────────────────────────────────────────────────────────────
 
@@ -630,6 +762,33 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
       {!context.problem.hasStatement && (
         <div style={{ ...getAlertStyle('warning'), marginBottom: SPACING.base }}>
           {i18n('ai_helper_testdata_warn_no_statement')}
+        </div>
+      )}
+      <div style={fieldStyle}>
+        <label style={labelStyle}>{i18n('ai_helper_testdata_profile_label')}</label>
+        <div style={{ display: 'flex', gap: SPACING.sm, flexWrap: 'wrap' }}>
+          {(['standard', 'hard'] as GenerationProfile[]).map(profile => (
+            <button
+              key={profile}
+              type="button"
+              aria-pressed={generationProfile === profile}
+              onClick={() => setGenerationProfile(profile)}
+              style={{
+                ...getButtonStyle(generationProfile === profile ? 'primary' : 'secondary'),
+                minWidth: '150px',
+              }}
+            >
+              {i18n(`ai_helper_testdata_profile_${profile}`)}
+            </button>
+          ))}
+        </div>
+        <div style={{ ...TYPOGRAPHY.xs, color: COLORS.textMuted, marginTop: SPACING.xs }}>
+          {i18n(`ai_helper_testdata_profile_${generationProfile}_hint`)}
+        </div>
+      </div>
+      {generationProfile === 'hard' && (
+        <div style={{ ...getAlertStyle('warning'), marginBottom: SPACING.base }}>
+          {i18n('ai_helper_testdata_profile_hard_warning')}
         </div>
       )}
       <div style={fieldStyle}>
@@ -819,6 +978,12 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
     const percent = Math.max(2, Math.min(100, Math.round(generationProgress.percent)));
     const elapsedMinutes = Math.floor(generationElapsedSeconds / 60);
     const elapsedSeconds = generationElapsedSeconds % 60;
+    const idleMinutes = Math.floor(generationIdleSeconds / 60);
+    const idleSeconds = generationIdleSeconds % 60;
+    const profileTiming = context?.generationProfiles?.[generationProfile]
+      || DEFAULT_GENERATION_PROFILES[generationProfile];
+    const longWaitThresholdSeconds = generationProfile === 'hard' ? 10 * 60 : 5 * 60;
+    const totalLimitMinutes = Math.round(profileTiming.totalTimeoutMs / 60_000);
     return (
       <div style={{ padding: SPACING.xl, color: COLORS.textSecondary }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: SPACING.sm, marginBottom: SPACING.base }}>
@@ -839,6 +1004,8 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
               {generationProgress.attempt > 1
                 ? ` · ${i18n('ai_helper_testdata_progress_attempt', generationProgress.attempt)}`
                 : ''}
+              {' · '}
+              {i18n(`ai_helper_testdata_profile_${generationProfile}`)}
             </div>
           </div>
           <div style={{ fontSize: '18px', fontWeight: 700, color: COLORS.primary, fontVariantNumeric: 'tabular-nums' }}>
@@ -865,10 +1032,46 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
           display: 'flex', justifyContent: 'space-between', gap: SPACING.sm,
           ...TYPOGRAPHY.xs, color: COLORS.textMuted, marginTop: SPACING.sm,
         }}>
-          <span>{i18n('ai_helper_testdata_generating_hint')}</span>
+          <span>{i18n(
+            generationProfile === 'hard'
+              ? 'ai_helper_testdata_generating_hint_hard'
+              : 'ai_helper_testdata_generating_hint_standard',
+            totalLimitMinutes,
+          )}</span>
           <span style={{ whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>
             {i18n('ai_helper_testdata_progress_elapsed', elapsedMinutes, String(elapsedSeconds).padStart(2, '0'))}
           </span>
+        </div>
+        {generationIdleSeconds >= 30 && (
+          <div style={{ ...TYPOGRAPHY.xs, color: COLORS.textMuted, marginTop: SPACING.xs }}>
+            {i18n(
+              'ai_helper_testdata_progress_last_update',
+              idleMinutes,
+              String(idleSeconds).padStart(2, '0'),
+            )}
+          </div>
+        )}
+        {generationIdleSeconds >= longWaitThresholdSeconds && generationProgress.stage !== 'model_fallback' && (
+          <div style={{ ...getAlertStyle('info'), marginTop: SPACING.base }}>
+            {i18n('ai_helper_testdata_progress_waiting_long')}
+          </div>
+        )}
+        <div style={{ ...getAlertStyle('success'), marginTop: SPACING.base }}>
+          {i18n(generationJobId
+            ? 'ai_helper_testdata_background_active'
+            : 'ai_helper_testdata_background_starting')}
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: SPACING.base }}>
+          <button
+            type="button"
+            style={getButtonStyle('secondary')}
+            onClick={handleCancelGeneration}
+            disabled={generationCanceling || !generationJobId}
+          >
+            {i18n(generationCanceling
+              ? 'ai_helper_testdata_canceling'
+              : 'ai_helper_testdata_cancel')}
+          </button>
         </div>
       </div>
     );
@@ -1080,7 +1283,7 @@ export const TestdataGenPanel: React.FC<TestdataGenPanelProps> = ({ problemId })
           </button>
           <button
             style={getButtonStyle('secondary')}
-            onClick={() => { setPhase('form'); setError(null); }}
+            onClick={handleBackToForm}
           >
             {i18n('ai_helper_testdata_back_btn')}
           </button>
